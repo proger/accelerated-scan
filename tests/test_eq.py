@@ -7,7 +7,7 @@ from accelerated_scan.warp import scan_forward as scan
 
 # https://arxiv.org/abs/2109.08203
 seeds = [3407,4,42,57]
-seqlens = [2**i for i in range(5, 13)]
+seqlens = [2**i for i in range(5, 17)]
 
 
 def init(seed, batch_size=3, dim=1536, seqlen=32, requires_grad=False):
