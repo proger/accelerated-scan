@@ -5,13 +5,19 @@
 #include <torch/extension.h>
 
 template <int kNStepsPerThread, int kNThreadsPerWarp, int kNWarpsPerBlock>
-__global__ void scan(float* gates, float* tokens, float* result) {
+__global__ void scan(
+    float* gates,
+    float* tokens,
+    float* result,
+    int batch_stride,
+    int dim_stride
+) {
     __shared__ float warpLastGate[kNWarpsPerBlock];
     __shared__ float warpLastToken[kNWarpsPerBlock];
 
-    const int threadId = threadIdx.x;
-    const int warpId = threadId / kNThreadsPerWarp;
-    const int laneId = threadId % kNThreadsPerWarp;
+    const int offset = blockIdx.x * batch_stride + blockIdx.y * dim_stride;
+    const int warpId = threadIdx.x / kNThreadsPerWarp;
+    const int laneId = threadIdx.x % kNThreadsPerWarp;
     constexpr int kWarpLast = kNThreadsPerWarp - 1;
     constexpr int kThreadLast = kNStepsPerThread - 1;
     constexpr float kEmptyGate = 1.0;
@@ -26,10 +32,10 @@ __global__ void scan(float* gates, float* tokens, float* result) {
 
     #pragma unroll
     for (int i = 0; i < kNStepsPerThread; ++i) {
-        float gate = gates[threadId * kNStepsPerThread + i];
-        float token = tokens[threadId * kNStepsPerThread + i];
+        float gate = gates[offset + threadIdx.x * kNStepsPerThread + i];
+        float token = tokens[offset + threadIdx.x * kNStepsPerThread + i];
         if (i == 0) {
-            acc[i] = {threadId == 0 ? kEmptyGate : gate, token};
+            acc[i] = {threadIdx.x == 0 ? kEmptyGate : gate, token};
         } else {
             acc[i] = {acc[i - 1].x * gate, acc[i - 1].y * gate + token};
         }
@@ -100,9 +106,9 @@ __global__ void scan(float* gates, float* tokens, float* result) {
     #pragma unroll
     for (int i = 0; i < kNStepsPerThread; ++i) {
         if (warpId > 0) {
-            result[threadId * kNStepsPerThread + i] = warpLastToken[warpId-1] * acc[i].x + acc[i].y;
+            result[offset + threadIdx.x * kNStepsPerThread + i] = warpLastToken[warpId-1] * acc[i].x + acc[i].y;
         } else {
-            result[threadId * kNStepsPerThread + i] = acc[i].y;
+            result[offset + threadIdx.x * kNStepsPerThread + i] = acc[i].y;
         }
     }
 }
@@ -113,6 +119,12 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
     TORCH_CHECK(gates.scalar_type() == at::ScalarType::Float);
     TORCH_CHECK(tokens.is_cuda());
     TORCH_CHECK(gates.is_cuda());
+    TORCH_CHECK(tokens.is_contiguous());
+    TORCH_CHECK(gates.is_contiguous());
+
+    const auto strides = tokens.strides();
+    const int batch_stride = strides[0];
+    const int dim_stride = strides[1];
     TORCH_CHECK(tokens.stride(-1) == 1 || tokens.size(-1) == 1);
     TORCH_CHECK(gates.stride(-1) == 1 || gates.size(-1) == 1);
 
@@ -122,81 +134,72 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
     const int seqlen = sizes[2];
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-    dim3 grid(1,1);
+    dim3 grid(batch_size, dim);
     constexpr int kNThreadsPerWarp = 32;
 
     if (seqlen == 32) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 1;
-        int kNThreads = seqlen;
+        int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 64) {
         constexpr int kNStepsPerThread = 2;
         constexpr int kNWarpsPerBlock = 1;
-        int kNThreads = seqlen;
+        int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 128) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 4;
-        int kNThreads = seqlen;
+        int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 256) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 8;
-        int kNThreads = seqlen;
+        int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 512) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 16;
-        int kNThreads = seqlen;
+        int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 1024) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 32;
-        int kNThreads = seqlen;
+        int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 2048) {
         constexpr int kNStepsPerThread = 2;
         constexpr int kNWarpsPerBlock = 32;
         int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else if (seqlen == 4096) {
         constexpr int kNStepsPerThread = 4;
         constexpr int kNWarpsPerBlock = 32;
         int kNThreads = seqlen / kNStepsPerThread;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(),
-            tokens.data_ptr<float>(),
-            out.data_ptr<float>()
+            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+            batch_stride, dim_stride
         );
     } else {
         TORCH_CHECK(false && "seqlen must be a power of 2, >= 32, <= 4096");

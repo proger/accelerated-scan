@@ -10,10 +10,10 @@ seeds = [3407,4,42,57]
 seqlens = [2**i for i in range(5, 13)]
 
 
-def init(seed, seqlen=32, requires_grad=False):
+def init(seed, batch_size=3, dim=1536, seqlen=32, requires_grad=False):
     torch.manual_seed(seed)
-    gates = 0.999 + 0.001 * torch.rand(1, 1, seqlen, requires_grad=requires_grad, device="cuda")
-    tokens = torch.rand(1, 1, seqlen, requires_grad=requires_grad, device="cuda")
+    gates = 0.999 + 0.001 * torch.rand(batch_size, dim, seqlen, requires_grad=requires_grad, device="cuda")
+    tokens = torch.rand(batch_size, dim, seqlen, requires_grad=requires_grad, device="cuda")
     if requires_grad:
         gates.retain_grad()
         tokens.retain_grad()
@@ -24,7 +24,7 @@ def init(seed, seqlen=32, requires_grad=False):
 @pytest.mark.parametrize("seqlen", seqlens)
 @torch.inference_mode()
 def test_eq_forward(seed, seqlen):
-    gates, tokens = init(seed, seqlen)
+    gates, tokens = init(seed, seqlen=seqlen)
     out = scan(gates, tokens)
     out_ref = scan_ref(gates, tokens)
 
