@@ -2,7 +2,7 @@ import pytest
 
 import torch
 from accelerated_scan.ref import scan as scan_ref
-from accelerated_scan.warp import scan_forward as scan
+from accelerated_scan.warp import scan
 #from accelerated_scan.triton import scan
 
 # https://arxiv.org/abs/2109.08203
@@ -29,20 +29,25 @@ def test_eq_forward(seed, seqlen):
     out_ref = scan_ref(gates, tokens)
 
     print('max error', (out - out_ref).abs().max())
-    print(out, 'out')
-    print(out_ref, 'ref')
+    # print(out, 'out')
+    # print(out_ref, 'ref')
 
     assert torch.allclose(out, out_ref) 
 
 
 @pytest.mark.parametrize("seed", seeds)
-def test_eq_backward(seed):
-    gates, tokens = init(seed, requires_grad=True)
+@pytest.mark.parametrize("seqlen", seqlens)
+def test_eq_backward(seed, seqlen):
+    gates, tokens = init(seed, seqlen=seqlen, requires_grad=True)
     scan(gates, tokens).sum().backward()
+    gates_grad = gates.grad
+    tokens_grad = tokens.grad
+    del gates
+    del tokens
 
-    gates_ref, tokens_ref = init(seed, requires_grad=True)
+    gates_ref, tokens_ref = init(seed, seqlen=seqlen, requires_grad=True)
     scan_ref(gates_ref, tokens_ref).sum().backward()
 
-    assert torch.allclose(gates.grad, gates_ref.grad)
-    assert torch.allclose(tokens.grad, tokens_ref.grad)
+    assert torch.allclose(gates_grad, gates_ref.grad)
+    assert torch.allclose(tokens_grad, tokens_ref.grad)
     

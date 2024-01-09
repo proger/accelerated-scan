@@ -10,7 +10,8 @@ __global__ void scan(
     const float* tokens,
     float* result,
     const int batch_stride,
-    const int dim_stride
+    const int dim_stride,
+    const bool reverse
 ) {
     __shared__ float warpLastGate[kNWarpsPerBlock];
     __shared__ float warpLastToken[kNWarpsPerBlock];
@@ -34,7 +35,7 @@ __global__ void scan(
     float2 acc[kNStepsPerThread];
 
     for (int chunk = 0; chunk < kNChunksPerSequence; chunk++) {
-        const int offset = seqoffset + chunk * chunklen;
+        const int offset = seqoffset + (reverse ? kNChunksPerSequence - 1 - chunk : chunk) * chunklen;
 
         if (chunk) {
             __syncthreads();
@@ -42,8 +43,9 @@ __global__ void scan(
 
         #pragma unroll
         for (int i = 0; i < kNStepsPerThread; ++i) {
-            float gate = gates[offset + threadIdx.x * kNStepsPerThread + i];
-            float token = tokens[offset + threadIdx.x * kNStepsPerThread + i];
+            const int chunkOffset = reverse ? chunklen - 1 - (threadIdx.x * kNStepsPerThread + i) : (threadIdx.x * kNStepsPerThread + i);
+            float gate = gates[offset + chunkOffset];
+            float token = tokens[offset + chunkOffset];
             if (i == 0) {
                 if (chunk == 0) {
                     acc[0] = {threadIdx.x == 0 ? kEmptyGate : gate, token};
@@ -124,10 +126,11 @@ __global__ void scan(
 
         #pragma unroll
         for (int i = 0; i < kNStepsPerThread; ++i) {
+            const int chunkOffset = reverse ? chunklen - 1 - (threadIdx.x * kNStepsPerThread + i) : (threadIdx.x * kNStepsPerThread + i);
             if (warpId > 0) {
                 acc[i] = {warpLastGate[warpId-1] * acc[i].x, warpLastToken[warpId-1] * acc[i].x + acc[i].y};
             }
-            result[offset + threadIdx.x * kNStepsPerThread + i] = acc[i].y;
+            result[offset + chunkOffset] = acc[i].y;
         }
 
         if (laneId == kWarpLast && warpId == kBlockLast) {
@@ -138,7 +141,7 @@ __global__ void scan(
 }
 
 at::Tensor
-warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out) {
+warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse) {
     TORCH_CHECK(tokens.scalar_type() == at::ScalarType::Float);
     TORCH_CHECK(gates.scalar_type() == at::ScalarType::Float);
     TORCH_CHECK(tokens.is_cuda());
@@ -168,7 +171,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 64) {
         constexpr int kNStepsPerThread = 2;
@@ -177,7 +180,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 128) {
         constexpr int kNStepsPerThread = 1;
@@ -186,7 +189,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 256) {
         constexpr int kNStepsPerThread = 1;
@@ -195,7 +198,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 512) {
         constexpr int kNStepsPerThread = 1;
@@ -204,7 +207,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 1024) {
         constexpr int kNStepsPerThread = 1;
@@ -213,7 +216,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 2048) {
         constexpr int kNStepsPerThread = 2;
@@ -222,7 +225,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 4096) {
         constexpr int kNStepsPerThread = 4;
@@ -231,7 +234,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 8192) {
         constexpr int kNStepsPerThread = 4;
@@ -240,7 +243,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 16384) {
         constexpr int kNStepsPerThread = 4;
@@ -249,7 +252,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 32768) {
         constexpr int kNStepsPerThread = 4;
@@ -258,7 +261,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 65536) {
         constexpr int kNStepsPerThread = 4;
@@ -267,7 +270,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
             gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
-            batch_stride, dim_stride
+            batch_stride, dim_stride, reverse
         );
     } else {
         TORCH_CHECK(false && "seqlen must be a power of 2, >= 32, <= 65536");
