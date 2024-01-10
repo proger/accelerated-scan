@@ -1,5 +1,7 @@
 # Accelerated Scan
 
+[![PyPI Version](https://img.shields.io/pypi/v/accelerated-scan.svg)](https://pypi.python.org/pypi/accelerated-scan)
+
 This package implements the fastest [first-order parallel associative scan](https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf) on the GPU for forward and [backward](https://arxiv.org/abs/1709.04057).
 
 The scan efficiently solves first-order recurrences of the form `x[t] = gate[t] * x[t-1] + token[t]`, common in state space models and linear RNNs.
