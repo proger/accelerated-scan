@@ -18,6 +18,7 @@ classifiers = [
 ]
 requires-python = ">= 3.8"
 license = {file = "LICENSE"}
+readme = "README.md"
 
 [tool.hatch.version]
 path = "accelerated_scan/__init__.py"
