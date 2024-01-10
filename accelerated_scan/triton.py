@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+assert triton.__version__ != '2.1.0'
+
 
 # manual tuple packing by @jackd from https://github.com/openai/triton/issues/2359
 @triton.jit

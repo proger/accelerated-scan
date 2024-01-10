@@ -23,10 +23,11 @@ module = load_inline(
         "--fmad", "false"
     ]
 )
+warpscan_forward = module.warpscan_forward
 
 def scan_forward(gates, tokens, reverse=False):
     output = torch.zeros_like(tokens)
-    module.warpscan_forward(gates, tokens, output, reverse)
+    warpscan_forward(gates, tokens, output, reverse)
     return output
 
 
