@@ -210,8 +210,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 1024) {
-        constexpr int kNStepsPerThread = 1;
-        constexpr int kNWarpsPerBlock = 32;
+        constexpr int kNStepsPerThread = 2;
+        constexpr int kNWarpsPerBlock = 16;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
