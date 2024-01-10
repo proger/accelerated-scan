@@ -11,12 +11,20 @@ The derivation of [Chunked Scan](https://proger.github.io/posts/scan/chunk.html)
 
 A similar implementation is available in `accelerated_scan.triton` using a Triton's `tl.associative_scan` primitive. It [requires Triton 2.2 for its `enable_fp_fusion` flag](https://twitter.com/darkproger/status/1742663555835363635).
 
+Quick Start:
+
+```bash
+pip install accelerated-scan
+```
 
 ```python
 import torch
 from accelerated_scan.warp import scan # a pure c++ kernel, faster than cub
 #from accelerated_scan.triton import scan # uses tl.associative_scan
 #from accelerated_scan.ref import scan # reference torch implementation
+
+# sequence lengths must be a power of 2 of lengths between 32 and 65536
+# hit me up if you need different lengths!
 
 batch_size, dim, seqlen = 3, 1536, 4096
 gates = 0.999 + 0.001 * torch.rand(batch_size, dim, seqlen, device="cuda")
