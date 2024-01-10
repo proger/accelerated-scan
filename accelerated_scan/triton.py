@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-assert triton.__version__ != '2.1.0'
+assert triton.__version__ != '2.1.0', 'Triton 2.1.0 is missing enable_fp_fusion. Triton 2.2.0 is required for numerical stability of this implementation.'
 
 
 # manual tuple packing by @jackd from https://github.com/openai/triton/issues/2359
