@@ -15,7 +15,7 @@ A similar implementation is available in `accelerated_scan.triton` using a Trito
 ```python
 import torch
 from accelerated_scan.warp import scan # a pure c++ kernel, faster than cub
-#from accelerated_scan.triton import scan # uses tl.associative_scan, fast on small sequences, requires chunking
+#from accelerated_scan.triton import scan # uses tl.associative_scan
 #from accelerated_scan.ref import scan # reference torch implementation
 
 batch_size, dim, seqlen = 3, 1536, 4096
