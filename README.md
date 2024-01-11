@@ -9,7 +9,7 @@ The scan efficiently solves first-order recurrences of the form `x[t] = gate[t] 
 The `accelerated_scan.warp` C++ CUDA kernel uses a chunked processing algorithm that leverages the fastest GPU communication primitives available
 on each level of hierarchy: [warp shuffles](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) within warps of 32 threads and shared memory (SRAM) between warps within a thread block. One sequence per channel dimension is confined to one thread block.
 
-The derivation of [Chunked Scan](https://proger.github.io/posts/scan/chunk.html) has been used to extend tree-level Blelloch algorithm to block
+The derivation of [Chunked Scan](https://proger.github.io/posts/scan/chunk.html) has been used to extend tree-level Blelloch algorithm to block.
 
 A similar implementation is available in `accelerated_scan.triton` using a Triton's `tl.associative_scan` primitive. It [requires Triton 2.2 for its `enable_fp_fusion` flag](https://twitter.com/darkproger/status/1742663555835363635).
 
@@ -58,3 +58,9 @@ forward speed of (8,1536,seqlen), inference mode:
 8          32768.0                               31.459671             62.557182               5.645697
 9          65536.0                               66.787331            125.208572              11.297921
 ```
+
+## Notes on Precision
+
+When gates and tokens are sampled uniformly from 0..1 the lack of bfloat16 precision dominates the error (compared to the recurrent implementation):
+
+![max-abs-error.png](max-abs-error.png)

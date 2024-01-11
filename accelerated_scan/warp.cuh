@@ -4,18 +4,18 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-template <int kNStepsPerThread, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence>
+template <typename weight_t, int kNStepsPerThread, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence>
 __global__ void scan(
-    const float* gates,
-    const float* tokens,
-    float* result,
+    const weight_t* gates,
+    const weight_t* tokens,
+    weight_t* result,
     const int batch_stride,
     const int dim_stride,
     const bool reverse
 ) {
-    __shared__ float warpLastGate[kNWarpsPerBlock];
-    __shared__ float warpLastToken[kNWarpsPerBlock];
-    __shared__ float chunkAccGate, chunkAccToken;
+    __shared__ weight_t warpLastGate[kNWarpsPerBlock];
+    __shared__ weight_t warpLastToken[kNWarpsPerBlock];
+    __shared__ weight_t chunkAccGate, chunkAccToken;
 
     const int seqoffset = blockIdx.x * batch_stride + blockIdx.y * dim_stride;
     const int warpId = threadIdx.x / kNThreadsPerWarp;
@@ -24,15 +24,16 @@ __global__ void scan(
     constexpr int kBlockLast = kNWarpsPerBlock - 1;
     constexpr int kWarpLast = kNThreadsPerWarp - 1;
     constexpr int kThreadLast = kNStepsPerThread - 1;
-    constexpr float kEmptyGate = 1.0;
-    constexpr float kEmptyToken = 0.0;
+    const weight_t kEmptyGate = 1.0;
+    const weight_t kEmptyToken = 0.0;
 
     //
     // Read from global memory.
     // Scan sequentially in thread registers (level 0).
     // 
 
-    float2 acc[kNStepsPerThread];
+    weight_t accGate[kNStepsPerThread];
+    weight_t accToken[kNStepsPerThread];
 
     for (int chunk = 0; chunk < kNChunksPerSequence; chunk++) {
         const int offset = seqoffset + (reverse ? kNChunksPerSequence - 1 - chunk : chunk) * chunklen;
@@ -44,21 +45,25 @@ __global__ void scan(
         #pragma unroll
         for (int i = 0; i < kNStepsPerThread; ++i) {
             const int chunkOffset = reverse ? chunklen - 1 - (threadIdx.x * kNStepsPerThread + i) : (threadIdx.x * kNStepsPerThread + i);
-            float gate = gates[offset + chunkOffset];
-            float token = tokens[offset + chunkOffset];
+            weight_t gate = gates[offset + chunkOffset];
+            weight_t token = tokens[offset + chunkOffset];
             if (i == 0) {
                 if (chunk == 0) {
-                    acc[0] = {threadIdx.x == 0 ? kEmptyGate : gate, token};
+                    accGate[0] = threadIdx.x == 0 ? kEmptyGate : gate;
+                    accToken[0] = token;
                 } else {
                     if (threadIdx.x == 0) {
                         // Add the last element of the previous chunk to the first element of the current chunk.
-                        acc[0] = {chunkAccGate * gate, chunkAccToken * gate + token};
+                        accGate[0] = chunkAccGate * gate;
+                        accToken[0] = chunkAccToken * gate + token;
                     } else {
-                        acc[0] = {gate, token};
+                        accGate[0] = gate;
+                        accToken[0] = token;
                     }
                 }
             } else {
-                acc[i] = {acc[i - 1].x * gate, acc[i - 1].y * gate + token};
+                accGate[i] = accGate[i - 1] * gate;
+                accToken[i] = accToken[i - 1] * gate + token;
             }
         }
 
@@ -68,13 +73,14 @@ __global__ void scan(
 
         #pragma unroll
         for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
-            float prev_gate = __shfl_up_sync(0xffffffff, acc[kThreadLast].x, delta);
-            float prev_token = __shfl_up_sync(0xffffffff, acc[kThreadLast].y, delta);
+            weight_t prev_gate = __shfl_up_sync(0xffffffff, accGate[kThreadLast], delta);
+            weight_t prev_token = __shfl_up_sync(0xffffffff, accToken[kThreadLast], delta);
 
             if (laneId >= delta) {
                 #pragma unroll
                 for (int i = 0; i < kNStepsPerThread; ++i) {
-                    acc[i] = {prev_gate * acc[i].x, prev_token * acc[i].x + acc[i].y};
+                    accToken[i] = prev_token * accGate[i] + accToken[i];
+                    accGate[i] = prev_gate * accGate[i];
                 }
             }
         }
@@ -86,8 +92,8 @@ __global__ void scan(
         //
 
         if (laneId == kWarpLast) {
-            warpLastGate[warpId] = acc[kThreadLast].x;
-            warpLastToken[warpId] = acc[kThreadLast].y;
+            warpLastGate[warpId] = accGate[kThreadLast];
+            warpLastToken[warpId] = accToken[kThreadLast];
         }
 
         __syncthreads();
@@ -97,23 +103,24 @@ __global__ void scan(
         //
 
         if (warpId == 0) {
-            float2 warpAcc;
-            warpAcc.x = (laneId < kNWarpsPerBlock) ? warpLastGate[laneId] : kEmptyGate;
-            warpAcc.y = (laneId < kNWarpsPerBlock) ? warpLastToken[laneId] : kEmptyToken;
+            weight_t warpAccGate, warpAccToken;
+            warpAccGate = (laneId < kNWarpsPerBlock) ? warpLastGate[laneId] : kEmptyGate;
+            warpAccToken = (laneId < kNWarpsPerBlock) ? warpLastToken[laneId] : kEmptyToken;
 
             #pragma unroll
             for (int delta = 1; delta < warpSize; delta *= 2) {
-                float prev_gate = __shfl_up_sync(0xffffffff, warpAcc.x, delta);
-                float prev_token = __shfl_up_sync(0xffffffff, warpAcc.y, delta);
+                weight_t prev_gate = __shfl_up_sync(0xffffffff, warpAccGate, delta);
+                weight_t prev_token = __shfl_up_sync(0xffffffff, warpAccToken, delta);
 
                 if (laneId >= delta) {
-                    warpAcc = {prev_gate * warpAcc.x, prev_token * warpAcc.x + warpAcc.y};
+                    warpAccToken = prev_token * warpAccGate + warpAccToken;
+                    warpAccGate = prev_gate * warpAccGate;
                 }
             }
 
             if (laneId < kNWarpsPerBlock) {
-                warpLastGate[laneId] = warpAcc.x;
-                warpLastToken[laneId] = warpAcc.y;
+                warpLastGate[laneId] = warpAccGate;
+                warpLastToken[laneId] = warpAccToken;
             }
         }
 
@@ -128,27 +135,22 @@ __global__ void scan(
         for (int i = 0; i < kNStepsPerThread; ++i) {
             const int chunkOffset = reverse ? chunklen - 1 - (threadIdx.x * kNStepsPerThread + i) : (threadIdx.x * kNStepsPerThread + i);
             if (warpId > 0) {
-                acc[i] = {warpLastGate[warpId-1] * acc[i].x, warpLastToken[warpId-1] * acc[i].x + acc[i].y};
+                accToken[i] = warpLastToken[warpId-1] * accGate[i] + accToken[i];
+                accGate[i] = warpLastGate[warpId-1] * accGate[i];
             }
-            result[offset + chunkOffset] = acc[i].y;
+            result[offset + chunkOffset] = accToken[i];
         }
 
         if (laneId == kWarpLast && warpId == kBlockLast) {
-            chunkAccGate = acc[kThreadLast].x;
-            chunkAccToken = acc[kThreadLast].y;
+            chunkAccGate = accGate[kThreadLast];
+            chunkAccToken = accToken[kThreadLast];
         }
     }
 }
 
-at::Tensor
-warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse) {
-    TORCH_CHECK(tokens.scalar_type() == at::ScalarType::Float);
-    TORCH_CHECK(gates.scalar_type() == at::ScalarType::Float);
-    TORCH_CHECK(tokens.is_cuda());
-    TORCH_CHECK(gates.is_cuda());
-    TORCH_CHECK(tokens.is_contiguous());
-    TORCH_CHECK(gates.is_contiguous());
-
+template <typename weight_t, typename torch_weight_t>
+void
+warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse) {
     const auto strides = tokens.strides();
     const int batch_stride = strides[0];
     const int dim_stride = strides[1];
@@ -169,8 +171,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 1;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 64) {
@@ -178,8 +180,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 1;
         constexpr int kNChunksPerSequence = 1;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 128) {
@@ -187,8 +189,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 4;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 256) {
@@ -196,8 +198,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 8;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 512) {
@@ -205,8 +207,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 16;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 1024) {
@@ -214,8 +216,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 16;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 2048) {
@@ -223,8 +225,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 32;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 4096) {
@@ -232,8 +234,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 32;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 8192) {
@@ -241,8 +243,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 2;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 16384) {
@@ -250,8 +252,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 4;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 32768) {
@@ -259,8 +261,8 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 8;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else if (seqlen == 65536) {
@@ -268,13 +270,33 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 16;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        scan<kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float2), stream>>>(
-            gates.data_ptr<float>(), tokens.data_ptr<float>(), out.data_ptr<float>(),
+        scan<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>(
+            reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()),
             batch_stride, dim_stride, reverse
         );
     } else {
         TORCH_CHECK(false && "seqlen must be a power of 2, >= 32, <= 65536");
     }
+}
 
+at::Tensor
+warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse) {
+    TORCH_CHECK(tokens.is_cuda());
+    TORCH_CHECK(gates.is_cuda());
+    TORCH_CHECK(tokens.is_contiguous());
+    TORCH_CHECK(gates.is_contiguous());
+
+    if (tokens.scalar_type() == at::ScalarType::BFloat16) {
+        TORCH_CHECK(gates.scalar_type() == at::ScalarType::BFloat16);
+        warpscan<__nv_bfloat16, at::BFloat16>(gates, tokens, out, reverse);
+    } else if (tokens.scalar_type() == at::ScalarType::Half) {
+        TORCH_CHECK(gates.scalar_type() == at::ScalarType::Half);
+        warpscan<__half, at::Half>(gates, tokens, out, reverse);
+    } else if (tokens.scalar_type() == at::ScalarType::Float) {
+        TORCH_CHECK(gates.scalar_type() == at::ScalarType::Float);
+        warpscan<float, float>(gates, tokens, out, reverse);
+    } else {
+        TORCH_CHECK(false && "Unsupported tensor dtype: expecting bfloat16, float16 or float32");
+    }
     return out;
 }

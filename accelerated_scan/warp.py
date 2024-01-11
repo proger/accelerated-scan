@@ -20,7 +20,9 @@ module = load_inline(
         "-std=c++17",
         "--ptxas-options=-v",
         "-lineinfo",
-        "--fmad", "false"
+        "--fmad", "false",
+        "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
     ]
 )
 warpscan_forward = module.warpscan_forward
