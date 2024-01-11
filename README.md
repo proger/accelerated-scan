@@ -61,6 +61,6 @@ forward speed of (8,1536,seqlen), inference mode:
 
 ## Notes on Precision
 
-When gates and tokens are sampled uniformly from 0..1 the lack of bfloat16 precision dominates the error (compared to the recurrent implementation):
+When gates and tokens are sampled uniformly from 0..1 the lack of bfloat16 precision dominates the error (compared to the reference implementation):
 
 ![max-abs-error.png](max-abs-error.png)
