@@ -48,9 +48,11 @@ def merge(lefts: torch.Tensor, rights: torch.Tensor) -> torch.Tensor:
 def scan(
     gates: torch.Tensor,
     tokens: torch.Tensor,
-    mul=torch.mul,
-    add=torch.add,
-    zeros_like=torch.zeros_like
+    mul: Callable = torch.mul,
+    add: Callable = torch.add,
+    zeros_like: Callable = torch.zeros_like,
+    ones_like: Callable = torch.ones_like,
+    reverse: bool = False
 ) -> torch.Tensor:
     """Solve a first-order recurrence relation using a reference torch implementation:
 
@@ -65,13 +67,16 @@ def scan(
         mul (callable): multiplication function, defaults to torch.mul
         add (callable): addition function, defaults to torch.add
         zeros_like (callable): function to create a tensor of zeros like the input, defaults to torch.zeros_like
+        ones_like (callable): function to create a tensor of ones like the input, defaults to torch.ones_like
+        reverse (bool): whether to solve the recurrence in reverse order, defaults to False
 
     Returns:
         (torch.Tensor): shape (B, C, T)
     """
     B,C,T = tokens.size()
     level = int(math.log2(T))
-    return add(mul(scan1(gates, tokens, mul, add, zeros_like, level=level), gates), tokens)
+    _, x = scan1(gates, tokens, mul, add, zeros_like, ones_like, level=level, reverse=reverse)
+    return add(mul(x, gates), tokens)
 
 
 def scan1(
@@ -80,19 +85,29 @@ def scan1(
     mul: Callable,
     add: Callable,
     zeros_like: Callable,
-    level: int
+    ones_like: Callable,
+    level: int,
+    reverse: bool = False
 ):
-    left_gates, right_gates = split(gates)
-    left_x, right_x = split(tokens)
+    if reverse:
+        right_gates, left_gates = split(gates)
+        right_x, left_x = split(tokens)
+    else:
+        left_gates, right_gates = split(gates)
+        left_x, right_x = split(tokens)
 
     # up: sum together
     gates = mul(left_gates, right_gates)
     tokens = add(mul(right_gates, left_x), right_x)
 
     if level == 1:
-        root_x = zeros_like(tokens)
+        root_gates, root_x = ones_like(tokens), zeros_like(tokens)
     else:
-        root_x = scan1(gates, tokens, mul, add, zeros_like, level=level-1)
+        root_gates, root_x = scan1(gates, tokens, mul, add, zeros_like, ones_like, level=level-1, reverse=reverse)
 
-    # down: left is root, right is left (+) right
-    return merge(root_x, add(mul(root_x, left_gates), left_x))
+    if reverse:
+        # down: right is root, left is left (+) right
+        return merge(mul(root_gates, left_gates), root_gates), merge(add(mul(root_x, left_gates), left_x), root_x)
+    else:
+        # down: left is root, right is left (+) right
+        return merge(root_gates, mul(root_gates, left_gates)), merge(root_x, add(mul(root_x, left_gates), left_x))

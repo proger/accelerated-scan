@@ -59,4 +59,31 @@ def test_eq_backward(scan, seed, seqlen, dtype):
 
     assert torch.allclose(gates_grad, gates_ref.grad, atol=atol[dtype])
     assert torch.allclose(tokens_grad, tokens_ref.grad, atol=atol[dtype])
-    
+
+
+@pytest.mark.parametrize("seed", [1])
+@pytest.mark.parametrize("seqlen", seqlens)
+def test_eq_ref_reverse(seed, seqlen):
+    generator = torch.Generator().manual_seed(seed)
+    B,C,T = 1, 1, seqlen
+    f = torch.randn(B, C, T, generator=generator, requires_grad=True)
+    x = torch.randn(B, C, T, generator=generator, requires_grad=True)
+
+    c = scan_ref(f, x)
+
+    dldc = torch.ones_like(c)
+
+    fpx = torch.cat([f, torch.ones_like(f[:, :, :1])], dim=-1)[:, :, 1:].contiguous()
+    dcdx = scan_ref(fpx, dldc, reverse=True)
+    cp = torch.cat([torch.zeros_like(c[:, :, :1]), c], dim=-1)[:, :, :-1].contiguous()
+    dcdf = dcdx * cp
+
+    c.sum().backward()
+    print(dcdx, 'dcdx')
+    print(x.grad, 'x.grad')
+    print((x.grad - dcdx).abs().max(), 'x error')
+    assert torch.allclose(x.grad, dcdx, atol=1e-5)
+    print(dcdf, 'dcdf')
+    print(f.grad, 'f.grad')
+    print((f.grad - dcdf).abs().max(), 'f error')
+    assert torch.allclose(f.grad, dcdf, atol=2e-5)
