@@ -1,6 +1,7 @@
 # Accelerated Scan
 
-[![PyPI Version](https://img.shields.io/pypi/v/accelerated-scan.svg)](https://pypi.python.org/pypi/accelerated-scan)
+[![PyPI Version](https://img.shields.io/pypi/v/accelerated-scan.svg)](https://pypi.python.org/pypi/accelerated-scan) [![DOI](https://zenodo.org/badge/741400326.svg)](https://zenodo.org/doi/10.5281/zenodo.10600962)
+
 
 This package implements the fastest [first-order parallel associative scan](https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf) on the GPU for forward and [backward](https://arxiv.org/abs/1709.04057).
 
