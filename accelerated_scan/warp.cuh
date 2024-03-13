@@ -4,37 +4,39 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-template<typename T>
-struct alignas(16) AlignedQuad {
-    T x;
-    T y;
-    T z;
-    T w;
+template<typename weight_t, int N>
+class UnalignedTuple {
+public:
+    static constexpr int Size = N;
+    using Type = weight_t;
 
-    __device__ AlignedQuad(T x, T y, T z, T w) : x(x), y(y), z(z), w(w) {}
+    weight_t data[N];
 
     __device__ void reverse() {
-        // Swap x and w
-        T temp = x;
-        x = w;
-        w = temp;
-
-        // Swap y and z
-        temp = y;
-        y = z;
-        z = temp;
+        #pragma unroll
+        for (int i = 0; i < N/2; i++) {
+            weight_t temp = data[i];
+            data[i] = data[N - (i+1)];
+            data[N - (i+1)] = temp;
+        }
     }
 };
 
-template <typename weight_t, int kNStepsPerThread, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence>
-__global__ void scanunaligned(
-    const weight_t* gates,
-    const weight_t* tokens,
-    weight_t* result,
+template<typename T, int N>
+class alignas(16) AlignedTuple : public UnalignedTuple<T, N> {
+};
+
+template <typename Tuple, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence>
+__global__ void scan(
+    const Tuple* gates,
+    const Tuple* tokens,
+    Tuple* result,
     const int batch_stride,
     const int dim_stride,
     const bool reverse
 ) {
+    using weight_t = typename Tuple::Type;
+
     __shared__ weight_t warpLastGate[kNWarpsPerBlock];
     __shared__ weight_t warpLastToken[kNWarpsPerBlock];
     __shared__ weight_t chunkAccGate, chunkAccToken;
@@ -42,10 +44,10 @@ __global__ void scanunaligned(
     const int seqoffset = blockIdx.x * batch_stride + blockIdx.y * dim_stride;
     const int warpId = threadIdx.x / kNThreadsPerWarp;
     const int laneId = threadIdx.x % kNThreadsPerWarp;
-    const int chunklen = blockDim.x * kNStepsPerThread;
+    const int chunklen = blockDim.x * Tuple::Size;
     constexpr int kBlockLast = kNWarpsPerBlock - 1;
     constexpr int kWarpLast = kNThreadsPerWarp - 1;
-    constexpr int kThreadLast = kNStepsPerThread - 1;
+    constexpr int kThreadLast = Tuple::Size - 1;
     const weight_t kEmptyGate = 1.0;
     const weight_t kEmptyToken = 0.0;
 
@@ -54,186 +56,47 @@ __global__ void scanunaligned(
     // Scan sequentially in thread registers (level 0).
     // 
 
-    weight_t accGate[kNStepsPerThread];
-    weight_t accToken[kNStepsPerThread];
-
     for (int chunk = 0; chunk < kNChunksPerSequence; chunk++) {
         const int offset = seqoffset + (reverse ? kNChunksPerSequence - 1 - chunk : chunk) * chunklen;
+        const int tupleOffset = (offset + (reverse ? chunklen - ((threadIdx.x + 1) * Tuple::Size) : (threadIdx.x * Tuple::Size))) / Tuple::Size;
 
         if (chunk) {
             __syncthreads();
         }
 
-        #pragma unroll
-        for (int i = 0; i < kNStepsPerThread; ++i) {
-            const int chunkOffset = reverse ? chunklen - 1 - (threadIdx.x * kNStepsPerThread + i) : (threadIdx.x * kNStepsPerThread + i);
-            weight_t gate = gates[offset + chunkOffset];
-            weight_t token = tokens[offset + chunkOffset];
-            if (i == 0) {
-                if (chunk == 0) {
-                    accGate[0] = threadIdx.x == 0 ? kEmptyGate : gate;
-                    accToken[0] = token;
-                } else {
-                    if (threadIdx.x == 0) {
-                        // Add the last element of the previous chunk to the first element of the current chunk.
-                        accGate[0] = chunkAccGate * gate;
-                        accToken[0] = chunkAccToken * gate + token;
-                    } else {
-                        accGate[0] = gate;
-                        accToken[0] = token;
-                    }
-                }
-            } else {
-                accGate[i] = accGate[i - 1] * gate;
-                accToken[i] = accToken[i - 1] * gate + token;
-            }
-        }
-
-        //
-        // Scan threads in a warp using shuffling (level 1).
-        //
-
-        #pragma unroll
-        for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
-            weight_t prev_gate = __shfl_up_sync(0xffffffff, accGate[kThreadLast], delta);
-            weight_t prev_token = __shfl_up_sync(0xffffffff, accToken[kThreadLast], delta);
-
-            if (laneId >= delta) {
-                #pragma unroll
-                for (int i = 0; i < kNStepsPerThread; ++i) {
-                    accToken[i] = prev_token * accGate[i] + accToken[i];
-                    accGate[i] = prev_gate * accGate[i];
-                }
-            }
-        }
-
-        __syncwarp();
-
-        //
-        // Store the last element of each warp in shared memory.
-        //
-
-        if (laneId == kWarpLast) {
-            warpLastGate[warpId] = accGate[kThreadLast];
-            warpLastToken[warpId] = accToken[kThreadLast];
-        }
-
-        __syncthreads();
-
-        //
-        // Leading warp scans every warp in a block (level 2).
-        //
-
-        if (warpId == 0) {
-            weight_t warpAccGate, warpAccToken;
-            warpAccGate = (laneId < kNWarpsPerBlock) ? warpLastGate[laneId] : kEmptyGate;
-            warpAccToken = (laneId < kNWarpsPerBlock) ? warpLastToken[laneId] : kEmptyToken;
-
-            #pragma unroll
-            for (int delta = 1; delta < warpSize; delta *= 2) {
-                weight_t prev_gate = __shfl_up_sync(0xffffffff, warpAccGate, delta);
-                weight_t prev_token = __shfl_up_sync(0xffffffff, warpAccToken, delta);
-
-                if (laneId >= delta) {
-                    warpAccToken = prev_token * warpAccGate + warpAccToken;
-                    warpAccGate = prev_gate * warpAccGate;
-                }
-            }
-
-            if (laneId < kNWarpsPerBlock) {
-                warpLastGate[laneId] = warpAccGate;
-                warpLastToken[laneId] = warpAccToken;
-            }
-        }
-
-        __syncthreads();
-
-        //
-        // Add the last element of the previous warp to each element of the current warp (level 0).
-        // Store to global memory.
-        //
-
-        #pragma unroll
-        for (int i = 0; i < kNStepsPerThread; ++i) {
-            const int chunkOffset = reverse ? chunklen - 1 - (threadIdx.x * kNStepsPerThread + i) : (threadIdx.x * kNStepsPerThread + i);
-            if (warpId > 0) {
-                accToken[i] = warpLastToken[warpId-1] * accGate[i] + accToken[i];
-                accGate[i] = warpLastGate[warpId-1] * accGate[i];
-            }
-            result[offset + chunkOffset] = accToken[i];
-        }
-
-        if (laneId == kWarpLast && warpId == kBlockLast) {
-            chunkAccGate = accGate[kThreadLast];
-            chunkAccToken = accToken[kThreadLast];
-        }
-    }
-}
-
-template <typename weight_t, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence>
-__global__ void scanaligned(
-    const weight_t* gates,
-    const weight_t* tokens,
-    weight_t* result,
-    const int batch_stride,
-    const int dim_stride,
-    const bool reverse
-) {
-    __shared__ weight_t warpLastGate[kNWarpsPerBlock];
-    __shared__ weight_t warpLastToken[kNWarpsPerBlock];
-    __shared__ weight_t chunkAccGate, chunkAccToken;
-
-    const int seqoffset = blockIdx.x * batch_stride + blockIdx.y * dim_stride;
-    const int warpId = threadIdx.x / kNThreadsPerWarp;
-    const int laneId = threadIdx.x % kNThreadsPerWarp;
-    const int chunklen = blockDim.x * 4;
-    constexpr int kBlockLast = kNWarpsPerBlock - 1;
-    constexpr int kWarpLast = kNThreadsPerWarp - 1;
-    constexpr int kThreadLast = 3;
-    const weight_t kEmptyGate = 1.0;
-    const weight_t kEmptyToken = 0.0;
-
-    //
-    // Read from global memory.
-    // Scan sequentially in thread registers (level 0).
-    // 
-
-    weight_t accGate[4];
-    weight_t accToken[4];
-
-    for (int chunk = 0; chunk < kNChunksPerSequence; chunk++) {
-        const int offset = seqoffset + (reverse ? kNChunksPerSequence - 1 - chunk : chunk) * chunklen;
-        const int quadOffset = (offset + (reverse ? chunklen - ((threadIdx.x + 1) * 4) : (threadIdx.x * 4))) / 4;
-
-        if (chunk) {
-            __syncthreads();
-        }
-
-        AlignedQuad<weight_t> loadedGate = reinterpret_cast<const struct AlignedQuad<weight_t> *>(gates)[quadOffset];
-        AlignedQuad<weight_t> loadedToken = reinterpret_cast<const struct AlignedQuad<weight_t> *>(tokens)[quadOffset];
+        Tuple loadedGate = gates[tupleOffset];
+        Tuple loadedToken = tokens[tupleOffset];
         if (reverse) {
             loadedGate.reverse();
             loadedToken.reverse();
         }
 
-        if (chunk == 0) {
-            accGate[0] = threadIdx.x == 0 ? kEmptyGate : loadedGate.x;
-            accToken[0] = loadedToken.x;
-        } else {
-            if (threadIdx.x == 0) {
-                accGate[0] = chunkAccGate * loadedGate.x;
-                accToken[0] = chunkAccToken * loadedGate.x + loadedToken.x;
+        Tuple accGate;
+        Tuple accToken;
+
+        #pragma unroll
+        for (int i = 0; i < Tuple::Size; ++i) {
+            weight_t gate = loadedGate.data[i];
+            weight_t token = loadedToken.data[i];
+            if (i == 0) {
+                if (chunk == 0) {
+                    accGate.data[0] = threadIdx.x == 0 ? kEmptyGate : gate;
+                    accToken.data[0] = token;
+                } else {
+                    if (threadIdx.x == 0) {
+                        // Add the last element of the previous chunk to the first element of the current chunk.
+                        accGate.data[0] = chunkAccGate * gate;
+                        accToken.data[0] = chunkAccToken * gate + token;
+                    } else {
+                        accGate.data[0] = gate;
+                        accToken.data[0] = token;
+                    }
+                }
             } else {
-                accGate[0] = loadedGate.x;
-                accToken[0] = loadedToken.x;
+                accGate.data[i] = accGate.data[i - 1] * gate;
+                accToken.data[i] = accToken.data[i - 1] * gate + token;
             }
         }
-        accGate[1] = accGate[0] * loadedGate.y;
-        accGate[2] = accGate[1] * loadedGate.z;
-        accGate[3] = accGate[2] * loadedGate.w;
-        accToken[1] = loadedToken.y + accToken[0] * loadedGate.y;
-        accToken[2] = loadedToken.z + accToken[1] * loadedGate.z;
-        accToken[3] = loadedToken.w + accToken[2] * loadedGate.w;
 
         //
         // Scan threads in a warp using shuffling (level 1).
@@ -241,14 +104,14 @@ __global__ void scanaligned(
 
         #pragma unroll
         for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
-            weight_t prev_gate = __shfl_up_sync(0xffffffff, accGate[kThreadLast], delta);
-            weight_t prev_token = __shfl_up_sync(0xffffffff, accToken[kThreadLast], delta);
+            weight_t prev_gate = __shfl_up_sync(0xffffffff, accGate.data[kThreadLast], delta);
+            weight_t prev_token = __shfl_up_sync(0xffffffff, accToken.data[kThreadLast], delta);
 
             if (laneId >= delta) {
                 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    accToken[i] = prev_token * accGate[i] + accToken[i];
-                    accGate[i] = prev_gate * accGate[i];
+                for (int i = 0; i < Tuple::Size; ++i) {
+                    accToken.data[i] = prev_token * accGate.data[i] + accToken.data[i];
+                    accGate.data[i] = prev_gate * accGate.data[i];
                 }
             }
         }
@@ -260,8 +123,8 @@ __global__ void scanaligned(
         //
 
         if (laneId == kWarpLast) {
-            warpLastGate[warpId] = accGate[kThreadLast];
-            warpLastToken[warpId] = accToken[kThreadLast];
+            warpLastGate[warpId] = accGate.data[kThreadLast];
+            warpLastToken[warpId] = accToken.data[kThreadLast];
         }
 
         __syncthreads();
@@ -300,40 +163,42 @@ __global__ void scanaligned(
         //
 
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < Tuple::Size; ++i) {
             if (warpId > 0) {
-                accToken[i] = warpLastToken[warpId-1] * accGate[i] + accToken[i];
-                accGate[i] = warpLastGate[warpId-1] * accGate[i];
+                accToken.data[i] = warpLastToken[warpId-1] * accGate.data[i] + accToken.data[i];
+                accGate.data[i] = warpLastGate[warpId-1] * accGate.data[i];
             }
         }
-
-        AlignedQuad<weight_t> outAccToken(accToken[0], accToken[1], accToken[2], accToken[3]);
         if (reverse) {
-            outAccToken.reverse();
+            accToken.reverse();
         }
-        reinterpret_cast<struct AlignedQuad<weight_t> *>(result)[quadOffset] = outAccToken;
+        result[tupleOffset] = accToken;
 
         if (laneId == kWarpLast && warpId == kBlockLast) {
-            chunkAccGate = accGate[kThreadLast];
-            chunkAccToken = accToken[kThreadLast];
+            chunkAccGate = accGate.data[kThreadLast];
+            chunkAccToken = accToken.data[kThreadLast];
         }
     }
 }
 
 #define DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, batch_stride, dim_stride, reverse) \
-    if (kNStepsPerThread == 4 && sizeof(weight_t) <= 4 && ((long)gates.data_ptr()) % 16 == 0 && \
-        ((long)tokens.data_ptr()) % 16 == 0 && ((long)out.data_ptr()) % 16 == 0) { \
-        scanaligned<weight_t, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
-                reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()), \
+    using AlignedT = AlignedTuple<weight_t, kNStepsPerThread>; \
+    using UnalignedT = UnalignedTuple<weight_t, kNStepsPerThread>; \
+    if (kNStepsPerThread == 4 && \
+        ((long)gates.data_ptr()) % 16 == 0 && \
+        ((long)tokens.data_ptr()) % 16 == 0 && \
+        ((long)out.data_ptr()) % 16 == 0) { \
+        scan<AlignedT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
+                reinterpret_cast<const AlignedT *>(gates.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<const AlignedT *>(tokens.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<AlignedT *>(out.data_ptr<torch_weight_t>()), \
                 batch_stride, dim_stride, reverse \
             ); \
     } else { \
-        scanunaligned<weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
-                reinterpret_cast<weight_t*>(gates.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<weight_t*>(tokens.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<weight_t*>(out.data_ptr<torch_weight_t>()), \
+        scan<UnalignedT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
+                reinterpret_cast<const UnalignedT*>(gates.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<const UnalignedT*>(tokens.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<UnalignedT *>(out.data_ptr<torch_weight_t>()), \
                 batch_stride, dim_stride, reverse \
             ); \
     }
