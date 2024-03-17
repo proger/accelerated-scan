@@ -370,8 +370,7 @@ __global__ void scan_grad(
     Tuple* gateGradOut,
     Tuple* valueGradOut,
     const int batch_stride,
-    const int dim_stride,
-    const bool reverse
+    const int dim_stride
 ) {
     using weight_t = typename Tuple::Type;
 
