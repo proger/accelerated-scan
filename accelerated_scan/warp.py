@@ -13,7 +13,7 @@ module = load_inline(
     name='warpscan',
     cpp_sources=[cpp_source],
     cuda_sources=[cuda_source],
-    functions=['warpscan_forward'],
+    functions=['warpscan_forward', 'warpscan_backward'],
     verbose=True,
     extra_cuda_cflags=[
         "-O3",
