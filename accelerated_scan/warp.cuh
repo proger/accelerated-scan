@@ -521,7 +521,7 @@ __global__ void scan_grad(
     }
 }
 
-#define DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, output, outGrad, gateGradOut, valueGradOut, batch_stride, dim_stride, reverse) \
+#define DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, output, outGrad, gateGradOut, valueGradOut, batch_stride, dim_stride) \
     using AlignedT = AlignedTuple<weight_t, kNStepsPerThread>; \
     using UnalignedT = UnalignedTuple<weight_t, kNStepsPerThread>; \
     if (kNStepsPerThread == 4 && \
@@ -536,7 +536,7 @@ __global__ void scan_grad(
                 reinterpret_cast<const AlignedT *>(outGrad.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<const AlignedT *>(gateGradOut.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<AlignedT *>(valueGradOut.data_ptr<torch_weight_t>()), \
-                batch_stride, dim_stride, reverse \
+                batch_stride, dim_stride \
             ); \
     } else { \
         scan_grad<UnalignedT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
@@ -545,7 +545,7 @@ __global__ void scan_grad(
                 reinterpret_cast<const UnalignedT*>(outGrad.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<const UnalignedT*>(gateGradOut.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<UnalignedT *>(valueGradOut.data_ptr<torch_weight_t>()), \
-                batch_stride, dim_stride, reverse \
+                batch_stride, dim_stride \
             ); \
     }
 
@@ -579,7 +579,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 64) {
         constexpr int kNStepsPerThread = 2;
         constexpr int kNWarpsPerBlock = 1;
@@ -588,7 +588,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 128) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 4;
@@ -597,7 +597,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 256) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 8;
@@ -606,7 +606,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 512) {
         constexpr int kNStepsPerThread = 1;
         constexpr int kNWarpsPerBlock = 16;
@@ -615,7 +615,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 1024) {
         constexpr int kNStepsPerThread = 2;
         constexpr int kNWarpsPerBlock = 16;
@@ -624,7 +624,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 2048) {
         constexpr int kNStepsPerThread = 2;
         constexpr int kNWarpsPerBlock = 32;
@@ -633,7 +633,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 4096) {
         constexpr int kNStepsPerThread = 4;
         constexpr int kNWarpsPerBlock = 32;
@@ -642,7 +642,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 8192) {
         constexpr int kNStepsPerThread = 4;
         constexpr int kNWarpsPerBlock = 32;
@@ -651,7 +651,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 16384) {
         constexpr int kNStepsPerThread = 4;
         constexpr int kNWarpsPerBlock = 32;
@@ -660,7 +660,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 32768) {
         constexpr int kNStepsPerThread = 4;
         constexpr int kNWarpsPerBlock = 32;
@@ -669,7 +669,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else if (seqlen == 65536) {
         constexpr int kNStepsPerThread = 4;
         constexpr int kNWarpsPerBlock = 32;
@@ -678,7 +678,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
-            batch_stride, dim_stride, reverse);
+            batch_stride, dim_stride);
     } else {
         TORCH_CHECK(false && "seqlen must be a power of 2, >= 32, <= 65536");
     }
