@@ -585,7 +585,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 1;
         constexpr int kNChunksPerSequence = 1;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -594,7 +594,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 4;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -603,7 +603,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 8;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -612,7 +612,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 16;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -621,7 +621,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 16;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -630,7 +630,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 32;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -639,7 +639,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 32;
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -648,7 +648,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 2;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -657,7 +657,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 4;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -666,7 +666,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 8;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
@@ -675,7 +675,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
         constexpr int kNWarpsPerBlock = 32;
         constexpr int kNChunksPerSequence = 16;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
-        DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
+        DISPATCH_SCAN_GRAD(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
             kNChunksPerSequence, grid, kNThreads, stream,
             gates, output, outGrad, gateGradOut, valueGradOut,
             batch_stride, dim_stride, reverse);
