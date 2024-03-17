@@ -509,7 +509,7 @@ __global__ void scan_grad(
 
         Tuple gateGrad = load_shifted_tuple<Tuple, -1>(output, tupleOffset, limit);
         for (int i = 0; i < Tuple::Size; i++) {
-            gateGrad.data[i] *= accToken.data[i];
+            gateGrad.data[i] = gateGrad.data[i] * accToken.data[i];
         }
         gateGradOut[tupleOffset] = gateGrad;
 
