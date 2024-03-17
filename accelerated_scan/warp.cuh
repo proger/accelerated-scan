@@ -683,7 +683,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
     }
 }
 
-at::Tensor
+void
 warpscan_backward(const at::Tensor &gates, const at::Tensor &output, const at::Tensor &outGrad, const at::Tensor& gateGradOut, const at::Tensor& valueGradOut) {
     TORCH_CHECK(gates.is_cuda());
     TORCH_CHECK(output.is_cuda());
@@ -700,13 +700,12 @@ warpscan_backward(const at::Tensor &gates, const at::Tensor &output, const at::T
     TORCH_CHECK(gates.sizes() == valueGradOut.sizes());
 
     if (gates.scalar_type() == at::ScalarType::BFloat16) {
-        warpscan_grad<__nv_bfloat16, at::BFloat16>(gates, outputs, outGrad, gateGradOut, valueGradOut);
+        warpscan_grad<__nv_bfloat16, at::BFloat16>(gates, output, outGrad, gateGradOut, valueGradOut);
     } else if (gates.scalar_type() == at::ScalarType::Half) {
-        warpscan_grad<__half, at::Half>(gates, outputs, outGrad, gateGradOut, valueGradOut);
+        warpscan_grad<__half, at::Half>(gates, output, outGrad, gateGradOut, valueGradOut);
     } else if (gates.scalar_type() == at::ScalarType::Float) {
-        warpscan_grad<float, float>(gates, outputs, outGrad, gateGradOut, valueGradOut);
+        warpscan_grad<float, float>(gates, output, outGrad, gateGradOut, valueGradOut);
     } else {
         TORCH_CHECK(false && "Unsupported tensor dtype: expecting bfloat16, float16 or float32");
     }
-    return out;
 }
