@@ -552,7 +552,7 @@ template <typename weight_t, typename torch_weight_t>
 void
 warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tensor &outGrad,
               const at::Tensor& gateGradOut, const at::Tensor& valueGradOut) {
-    const auto strides = tokens.strides();
+    const auto strides = gates.strides();
     const int batch_stride = strides[0];
     const int dim_stride = strides[1];
     CHECK_STRIDE(gates);
@@ -561,7 +561,7 @@ warpscan_grad(const at::Tensor &gates, const at::Tensor &output, const at::Tenso
     CHECK_STRIDE(gateGradOut);
     CHECK_STRIDE(valueGradOut);
 
-    const auto sizes = tokens.sizes();
+    const auto sizes = gates.sizes();
     const int batch_size = sizes[0];
     const int dim = sizes[1];
     const int seqlen = sizes[2];
