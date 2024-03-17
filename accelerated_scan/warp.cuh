@@ -533,16 +533,16 @@ __global__ void scan_grad(
                 reinterpret_cast<const AlignedT *>(gates.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<const AlignedT *>(output.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<const AlignedT *>(outGrad.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<const AlignedT *>(gateGradOut.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<AlignedT *>(gateGradOut.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<AlignedT *>(valueGradOut.data_ptr<torch_weight_t>()), \
                 batch_stride, dim_stride \
             ); \
     } else { \
         scan_grad<UnalignedT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
-                reinterpret_cast<const UnalignedT*>(gates.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<const UnalignedT*>(output.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<const UnalignedT*>(outGrad.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<const UnalignedT*>(gateGradOut.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<const UnalignedT *>(gates.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<const UnalignedT *>(output.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<const UnalignedT *>(outGrad.data_ptr<torch_weight_t>()), \
+                reinterpret_cast<UnalignedT *>(gateGradOut.data_ptr<torch_weight_t>()), \
                 reinterpret_cast<UnalignedT *>(valueGradOut.data_ptr<torch_weight_t>()), \
                 batch_stride, dim_stride \
             ); \
