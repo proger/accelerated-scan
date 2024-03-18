@@ -347,7 +347,7 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
 }
 
 template <typename Tuple, int offset>
-Tuple load_shifted_tuple(const Tuple* ptr, int index, int limit) {
+__device__ Tuple load_shifted_tuple(const Tuple* ptr, int index, int limit) {
     using weight_t = typename Tuple::Type;
 
     const weight_t* rawPtr = reinterpret_cast<const weight_t *>(ptr);
