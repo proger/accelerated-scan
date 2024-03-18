@@ -353,8 +353,8 @@ Tuple load_shifted_tuple(const Tuple* ptr, int index, int limit) {
     const weight_t* rawPtr = reinterpret_cast<const weight_t *>(ptr);
     Tuple x;
     for (int i = 0; i < Tuple::Size; i++) {
-        const int offset = index*4 + i + offset;
-        if (offset >= 0 && offset < limit*4) {
+        const int idx = index * Tuple::Size + i + offset;
+        if (idx >= 0 && idx < limit * Tuple::Size) {
             x.data[i] = rawPtr[offset];
         }
     }
@@ -502,9 +502,7 @@ __global__ void scan_grad(
                 accGate.data[i] = warpLastGate[warpId-1] * accGate.data[i];
             }
         }
-        if (reverse) {
-            accToken.reverse();
-        }
+        accToken.reverse();
         valueGradOut[tupleOffset] = accToken;
 
         Tuple gateGrad = load_shifted_tuple<Tuple, -1>(output, tupleOffset, limit);
