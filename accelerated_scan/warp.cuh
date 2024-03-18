@@ -355,7 +355,7 @@ __device__ Tuple load_shifted_tuple(const Tuple* ptr, int index, int limit) {
     for (int i = 0; i < Tuple::Size; i++) {
         const int idx = index * Tuple::Size + i + offset;
         if (idx >= 0 && idx < limit * Tuple::Size) {
-            x.data[i] = rawPtr[offset];
+            x.data[i] = rawPtr[idx];
         } else {
             x.data[i] = 0.0;
         }
