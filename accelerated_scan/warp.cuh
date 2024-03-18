@@ -391,8 +391,8 @@ __global__ void scan_grad(
     const weight_t kEmptyToken = 0.0;
 
     // Limits for loading shifted tuples.
-    const int minIdx = blockDim.x * kNChunksPerSequence * blockIdx.x;
-    const int maxIdx = blockDim.x * kNChunksPerSequence * (blockIdx.x + 1);
+    const int minIdx = seqoffset / Tuple::Size;
+    const int maxIdx = minIdx + blockDim.x * kNChunksPerSequence;
 
     for (int chunk = 0; chunk < kNChunksPerSequence; chunk++) {
         const int offset = seqoffset + (kNChunksPerSequence - 1 - chunk) * chunklen;
