@@ -7,6 +7,7 @@ cuda_source = (Path(__file__).parent / 'warp.cuh').read_text()
 
 cpp_source = """
 at::Tensor warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse);
+void warpscan_backward(const at::Tensor &gates, const at::Tensor &output, const at::Tensor &outGrad, const at::Tensor& gateGradOut, const at::Tensor& valueGradOut);
 """
 
 module = load_inline(
