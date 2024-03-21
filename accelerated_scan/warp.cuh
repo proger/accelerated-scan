@@ -4,6 +4,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#define CHECK_STRIDE(x) TORCH_CHECK(x.stride(-1) == 1 || x.size(-1) == 1);
+
 template<typename weight_t, int N>
 class UnalignedTuple {
 public:
@@ -26,11 +28,33 @@ template<typename T, int N>
 class alignas(16) AlignedTuple : public UnalignedTuple<T, N> {
 };
 
-template <typename Tuple, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence>
+template <typename Tuple, int offset>
+__device__ Tuple load_shifted_tuple(const Tuple* ptr, int index, int minIdx, int maxIdx) {
+    using weight_t = typename Tuple::Type;
+
+    const weight_t* rawPtr = reinterpret_cast<const weight_t *>(ptr);
+    Tuple x;
+    for (int i = 0; i < Tuple::Size; i++) {
+        const int idx = index * Tuple::Size + i + offset;
+        if (idx >= minIdx * Tuple::Size && idx < maxIdx * Tuple::Size) {
+            x.data[i] = rawPtr[idx];
+        } else {
+            x.data[i] = 0.0;
+        }
+    }
+
+    return x;
+}
+
+template <typename Tuple, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence, bool backward>
 __global__ void scan(
     const Tuple* gates,
     const Tuple* tokens,
     Tuple* result,
+    // Only passed if backward is True.
+    const Tuple* output,
+    Tuple* gateGradOut,
+    // Shape information
     const int batch_stride,
     const int dim_stride,
     const bool reverse
@@ -51,6 +75,10 @@ __global__ void scan(
     const weight_t kEmptyGate = 1.0;
     const weight_t kEmptyToken = 0.0;
 
+    // Limits for loading shifted tuples during backward pass.
+    const int minIdx = seqoffset / Tuple::Size;
+    const int maxIdx = minIdx + blockDim.x * kNChunksPerSequence;
+
     //
     // Read from global memory.
     // Scan sequentially in thread registers (level 0).
@@ -64,7 +92,12 @@ __global__ void scan(
             __syncthreads();
         }
 
-        Tuple loadedGate = gates[tupleOffset];
+        Tuple loadedGate;
+        if (backward) {
+            loadedGate = load_shifted_tuple<Tuple, 1>(gates, tupleOffset, minIdx, maxIdx);
+        } else {
+            loadedGate = gates[tupleOffset];
+        }
         Tuple loadedToken = tokens[tupleOffset];
         if (reverse) {
             loadedGate.reverse();
@@ -174,6 +207,14 @@ __global__ void scan(
         }
         result[tupleOffset] = accToken;
 
+        if (backward) {
+            Tuple gateGrad = load_shifted_tuple<Tuple, -1>(output, tupleOffset, minIdx, maxIdx);
+            for (int i = 0; i < Tuple::Size; i++) {
+                gateGrad.data[i] = gateGrad.data[i] * accToken.data[i];
+            }
+            gateGradOut[tupleOffset] = gateGrad;
+        }
+
         if (laneId == kWarpLast && warpId == kBlockLast) {
             chunkAccGate = accGate.data[kThreadLast];
             chunkAccToken = accToken.data[kThreadLast];
@@ -181,36 +222,53 @@ __global__ void scan(
     }
 }
 
-#define DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, batch_stride, dim_stride, reverse) \
+#define DISPATCH_SCAN_INNER(TupleT, backward, weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse) \
+    scan<TupleT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, backward><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
+        reinterpret_cast<const TupleT *>(gates.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<const TupleT *>(tokens.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<TupleT *>(out.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<const TupleT *>(output), \
+        reinterpret_cast<TupleT *>(gateGradOut), \
+        batch_stride, dim_stride, reverse \
+    );
+
+#define DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse) \
     using AlignedT = AlignedTuple<weight_t, kNStepsPerThread>; \
     using UnalignedT = UnalignedTuple<weight_t, kNStepsPerThread>; \
     if (kNStepsPerThread == 4 && \
         ((long)gates.data_ptr()) % 16 == 0 && \
         ((long)tokens.data_ptr()) % 16 == 0 && \
-        ((long)out.data_ptr()) % 16 == 0) { \
-        scan<AlignedT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
-                reinterpret_cast<const AlignedT *>(gates.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<const AlignedT *>(tokens.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<AlignedT *>(out.data_ptr<torch_weight_t>()), \
-                batch_stride, dim_stride, reverse \
-            ); \
+        ((long)out.data_ptr()) % 16 == 0 && \
+        ((long)output) % 16 == 0 && \
+        ((long)gateGradOut) % 16 == 0) { \
+        if (output) { \
+            DISPATCH_SCAN_INNER(AlignedT, true, weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse); \
+        } else { \
+            DISPATCH_SCAN_INNER(AlignedT, false, weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse); \
+        } \
     } else { \
-        scan<UnalignedT, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
-                reinterpret_cast<const UnalignedT*>(gates.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<const UnalignedT*>(tokens.data_ptr<torch_weight_t>()), \
-                reinterpret_cast<UnalignedT *>(out.data_ptr<torch_weight_t>()), \
-                batch_stride, dim_stride, reverse \
-            ); \
+        if (output) { \
+            DISPATCH_SCAN_INNER(UnalignedT, true, weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse); \
+        } else { \
+            DISPATCH_SCAN_INNER(UnalignedT, false, weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse); \
+        } \
     }
 
 template <typename weight_t, typename torch_weight_t>
 void
-warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse) {
+warpscan(
+    const at::Tensor &gates,
+    const at::Tensor &tokens,
+    const at::Tensor &out,
+    const void *output,
+    void *gateGradOut,
+    const bool reverse
+) {
     const auto strides = tokens.strides();
     const int batch_stride = strides[0];
     const int dim_stride = strides[1];
-    TORCH_CHECK(tokens.stride(-1) == 1 || tokens.size(-1) == 1);
-    TORCH_CHECK(gates.stride(-1) == 1 || gates.size(-1) == 1);
+    CHECK_STRIDE(tokens);
+    CHECK_STRIDE(gates);
 
     const auto sizes = tokens.sizes();
     const int batch_size = sizes[0];
@@ -227,7 +285,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 64) {
         constexpr int kNStepsPerThread = 2;
@@ -235,7 +293,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         constexpr int kNChunksPerSequence = 1;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 128) {
         constexpr int kNStepsPerThread = 1;
@@ -243,7 +301,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 256) {
         constexpr int kNStepsPerThread = 1;
@@ -251,7 +309,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 512) {
         constexpr int kNStepsPerThread = 1;
@@ -259,7 +317,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 1024) {
         constexpr int kNStepsPerThread = 2;
@@ -267,7 +325,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 2048) {
         constexpr int kNStepsPerThread = 2;
@@ -275,7 +333,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 4096) {
         constexpr int kNStepsPerThread = 4;
@@ -283,7 +341,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         int kNThreads = seqlen / kNStepsPerThread;
         constexpr int kNChunksPerSequence = 1;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 8192) {
         constexpr int kNStepsPerThread = 4;
@@ -291,7 +349,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         constexpr int kNChunksPerSequence = 2;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 16384) {
         constexpr int kNStepsPerThread = 4;
@@ -299,7 +357,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         constexpr int kNChunksPerSequence = 4;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 32768) {
         constexpr int kNStepsPerThread = 4;
@@ -307,7 +365,7 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         constexpr int kNChunksPerSequence = 8;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else if (seqlen == 65536) {
         constexpr int kNStepsPerThread = 4;
@@ -315,12 +373,23 @@ warpscan(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &ou
         constexpr int kNChunksPerSequence = 16;
         int kNThreads = seqlen / kNStepsPerThread / kNChunksPerSequence;
         DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock,
-            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out,
+            kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut,
             batch_stride, dim_stride, reverse);
     } else {
         TORCH_CHECK(false && "seqlen must be a power of 2, >= 32, <= 65536");
     }
 }
+
+#define DISPATCH_WARPSCAN(gates, ...) \
+    if (gates.scalar_type() == at::ScalarType::BFloat16) { \
+        warpscan<__nv_bfloat16, at::BFloat16>(gates, __VA_ARGS__); \
+    } else if (gates.scalar_type() == at::ScalarType::Half) { \
+        warpscan<__half, at::Half>(gates, __VA_ARGS__); \
+    } else if (gates.scalar_type() == at::ScalarType::Float) { \
+        warpscan<float, float>(gates, __VA_ARGS__); \
+    } else { \
+        TORCH_CHECK(false && "Unsupported tensor dtype: expecting bfloat16, float16 or float32"); \
+    }
 
 at::Tensor
 warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse) {
@@ -328,18 +397,28 @@ warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Te
     TORCH_CHECK(gates.is_cuda());
     TORCH_CHECK(tokens.is_contiguous());
     TORCH_CHECK(gates.is_contiguous());
+    TORCH_CHECK(tokens.scalar_type() == gates.scalar_type());
+    TORCH_CHECK(tokens.scalar_type() == out.scalar_type());
 
-    if (tokens.scalar_type() == at::ScalarType::BFloat16) {
-        TORCH_CHECK(gates.scalar_type() == at::ScalarType::BFloat16);
-        warpscan<__nv_bfloat16, at::BFloat16>(gates, tokens, out, reverse);
-    } else if (tokens.scalar_type() == at::ScalarType::Half) {
-        TORCH_CHECK(gates.scalar_type() == at::ScalarType::Half);
-        warpscan<__half, at::Half>(gates, tokens, out, reverse);
-    } else if (tokens.scalar_type() == at::ScalarType::Float) {
-        TORCH_CHECK(gates.scalar_type() == at::ScalarType::Float);
-        warpscan<float, float>(gates, tokens, out, reverse);
-    } else {
-        TORCH_CHECK(false && "Unsupported tensor dtype: expecting bfloat16, float16 or float32");
-    }
+    DISPATCH_WARPSCAN(gates, tokens, out, nullptr, nullptr, reverse);
     return out;
+}
+
+void
+warpscan_backward(const at::Tensor &gates, const at::Tensor &output, const at::Tensor &outGrad, const at::Tensor& gateGradOut, const at::Tensor& tokenGradOut) {
+    TORCH_CHECK(gates.is_cuda());
+    TORCH_CHECK(output.is_cuda());
+    TORCH_CHECK(outGrad.is_cuda());
+    TORCH_CHECK(gateGradOut.is_contiguous());
+    TORCH_CHECK(tokenGradOut.is_contiguous());
+    TORCH_CHECK(gates.scalar_type() == output.scalar_type());
+    TORCH_CHECK(gates.scalar_type() == outGrad.scalar_type());
+    TORCH_CHECK(gates.scalar_type() == gateGradOut.scalar_type());
+    TORCH_CHECK(gates.scalar_type() == tokenGradOut.scalar_type());
+    TORCH_CHECK(gates.sizes() == output.sizes());
+    TORCH_CHECK(gates.sizes() == outGrad.sizes());
+    TORCH_CHECK(gates.sizes() == gateGradOut.sizes());
+    TORCH_CHECK(gates.sizes() == tokenGradOut.sizes());
+
+    DISPATCH_WARPSCAN(gates, outGrad, tokenGradOut, output.data_ptr(), gateGradOut.data_ptr(), true);
 }

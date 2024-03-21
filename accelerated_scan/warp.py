@@ -7,13 +7,14 @@ cuda_source = (Path(__file__).parent / 'warp.cuh').read_text()
 
 cpp_source = """
 at::Tensor warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse);
+void warpscan_backward(const at::Tensor &gates, const at::Tensor &output, const at::Tensor &outGrad, const at::Tensor& gateGradOut, const at::Tensor& valueGradOut);
 """
 
 module = load_inline(
     name='warpscan',
     cpp_sources=[cpp_source],
     cuda_sources=[cuda_source],
-    functions=['warpscan_forward'],
+    functions=['warpscan_forward', 'warpscan_backward'],
     verbose=True,
     extra_cuda_cflags=[
         "-O3",
@@ -26,6 +27,7 @@ module = load_inline(
     ]
 )
 warpscan_forward = module.warpscan_forward
+warpscan_backward = module.warpscan_backward
 
 def scan_forward(gates, tokens, reverse=False):
     output = torch.zeros_like(tokens)
@@ -56,13 +58,10 @@ class Scan(torch.autograd.Function):
         assert states.is_contiguous()
         assert gates.is_contiguous()
 
-        padded_shifted_gates = torch.cat([gates, torch.ones_like(gates[:, :, :1])], dim=-1)[:, :, 1:].contiguous()
-        d_states = scan_forward(padded_shifted_gates, grad_output, reverse=True)
+        d_gates = torch.empty_like(gates)
+        d_tokens = torch.empty_like(gates)
+        warpscan_backward(gates, states, grad_output, d_gates, d_tokens)
 
-        padded_outputs = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)[:, :, :-1]
-        d_gates = padded_outputs * d_states
-
-        d_tokens = d_states
         return d_gates, d_tokens
 
 
