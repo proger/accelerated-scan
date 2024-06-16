@@ -65,3 +65,12 @@ forward speed of (8,1536,seqlen), inference mode:
 When gates and tokens are sampled uniformly from 0..1 the lack of bfloat16 precision dominates the error (compared to the reference implementation):
 
 ![max-abs-error.png](max-abs-error.png)
+
+
+## Attention
+
+```
+(cd accelerated_scan; python3 kitten_setup.py  build)
+ncu -k causal_attend_kernel python3 ./tests/single.py
+python3 ./tests/bench.py  --direction forward
+```
