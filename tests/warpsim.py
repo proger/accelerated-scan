@@ -1,12 +1,11 @@
 # timesteps_per_tile = rows of q
-
-NUM_WORKERS = 8 # how many warps
+# NUM_WORKERS = number of warps
 
 def load(*args):
     pass
 
 # all to all attention
-def sim_full(warpid, n=4, timesteps_per_tile=1, NUM_WORKERS=NUM_WORKERS):
+def sim_full(warpid, n=4, timesteps_per_tile=1, NUM_WORKERS=4):
     qo_blocks = n//(timesteps_per_tile*NUM_WORKERS)
     kv_blocks = n//(timesteps_per_tile*NUM_WORKERS)
     for q_blk in range(qo_blocks):
@@ -21,11 +20,13 @@ def sim_full(warpid, n=4, timesteps_per_tile=1, NUM_WORKERS=NUM_WORKERS):
         # store here
 
 # causal attention
-def sim(warpid, n=8, timesteps_per_tile=1, NUM_WORKERS=NUM_WORKERS):
-    qo_blocks = n//(timesteps_per_tile*NUM_WORKERS)
+def sim(warpid, NUM_WORKERS, seqlen=4, timestep_tiles_per_thread=1, timesteps_per_tile=1):
+    time_stride = timestep_tiles_per_thread*timesteps_per_tile
+    qo_blocks = seqlen//(time_stride*NUM_WORKERS)
     
     for q_blk in range(qo_blocks):
-        q_seq = (q_blk * NUM_WORKERS + warpid) * timesteps_per_tile
+        q_seq = (q_blk * NUM_WORKERS + warpid) * time_stride
+        q_end = q_seq + time_stride
         load(q_seq)
 
         #kv_blocks = n//(timesteps_per_tile*NUM_WORKERS)
@@ -34,18 +35,20 @@ def sim(warpid, n=8, timesteps_per_tile=1, NUM_WORKERS=NUM_WORKERS):
 
         for kv_blk in range(q_blk,-1,-1):
             kv_warp_index = kv_blk * NUM_WORKERS + warpid
-            kv_seq = kv_warp_index * timesteps_per_tile # one warp loads the whole kv block to memory
+            kv_seq = kv_warp_index * time_stride # one warp loads the whole kv block to memory
             if q_seq >= kv_seq:
                 load(kv_seq)
             #print(f"{warpid=} {q_seq=} {kv_blk=} {kv_seq=}")
             for subtile in range(NUM_WORKERS,-1,-1):
-                k_block_index = kv_blk * NUM_WORKERS + subtile # every warp now accesses every block in share memory
-                k_index = k_block_index * timesteps_per_tile
-                if q_seq >= k_index:
-                    load(k_index)
-                    print(f"{warpid=} {kv_seq=} q[{q_seq}]@k[{k_index}]")
+                k_seq = (kv_blk * NUM_WORKERS + subtile) * time_stride # every warp now accesses every block in share memory
+                k_end = k_seq + time_stride
+                if q_seq >= k_seq:
+                    load(k_seq)
+                    needs_make_causal = "\\" if q_seq == k_seq else ""
+                    print(f"{warpid=} {kv_seq=} q[{q_seq}:{q_end}]@k[{k_seq}:{k_end}] {needs_make_causal}")
         # store here
 
 
+NUM_WORKERS = 4
 for warpid in range(NUM_WORKERS):
-    sim(warpid)
+    sim(warpid, NUM_WORKERS)

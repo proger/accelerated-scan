@@ -16,7 +16,7 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         x_names=["SEQUENCE_LENGTH"],  # argument names to use as an x-axis for the plot
         #x_vals=[2**i for i in range(7, max_exponent)],
         #x_vals=[512,1024,2048,4096,8192,16384],
-        x_vals=[512,1024,2048],
+        x_vals=[128,256],
         #x_vals=[512,1024,2048,4096,8192,16384],
         xlabel='sequence length',
         ylabel='ms',
@@ -27,8 +27,8 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         #line_vals=["triton", "ref", "warp"],
         #line_names=["flash", "kittenexp", "warp"],
         #line_vals=["flash", "kittenexp", "warp"],
-        line_names=["kittenexp", "flash"],
-        line_vals=["kittenexp", "flash"],
+        line_names=["linear-kitten", "flash2"],
+        line_vals=["kitten", "flash"],
         plot_name=plot_name,
         args={
             "direction": direction,
@@ -45,7 +45,7 @@ from collections import defaultdict
 c = defaultdict(int)
 
 def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward", "backward", "train"] = "forward"):
-    B, H, D, T = 32, 64, 64, SEQUENCE_LENGTH
+    B, H, D, T = 32, 64, 32, SEQUENCE_LENGTH
     gates, tokens = init(B, H*D, T, device=device, requires_grad=direction=="train")
     outputs = torch.empty_like(tokens)
     grad_outputs = torch.empty_like(tokens)
@@ -92,7 +92,7 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
                     from accelerated_scan.warp import scan as train_scan
                     scan = lambda: grad2(train_scan, gates, tokens, grad_outputs)
 
-        case "kittenexp":
+        case "kitten":
             print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
             from accelerated_scan.kitten import attend
 
