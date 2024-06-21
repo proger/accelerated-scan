@@ -24,7 +24,7 @@ module = load_inline(
         "--use_fast_math",
         "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-DKITTENS_4090", "-arch=sm_80",
+        "-DKITTENS_4090",
         f"-I{str(Path(__file__).parent)}"
     ]
 )
