@@ -41,8 +41,7 @@ __global__ void causal_attend_kernel(
         auto q_index = q_blk*kNumWorkers + warpid;
         load(q_reg, _q + q_index*q_reg.num_elements, q_reg.cols);
 
-        // zero flash attention O register.
-        zero(o_reg);
+        zero(o_reg); // zero flash attention O register.
 
         // iterate over k, v for these q's that have been loaded
         for(auto kv_blk = q_blk; kv_blk >= 0; kv_blk--) {
@@ -68,7 +67,6 @@ __global__ void causal_attend_kernel(
                 copy(att_block_mma, att_block); // convert to bf16 for mma_AB
 
                 if (kv_subtile_index == q_index) {
-                    //make_causal(att_block_mma, att_block_mma, kittens::base_types::constants<bf16>::zero());
                     make_causal(att_block_mma, att_block_mma, 0);
                 }
 
@@ -109,7 +107,6 @@ attend(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor f, torch
 
     using H = c10::BFloat16;
     constexpr int kHeight = 4; // tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
-
     constexpr int kWidth = 2; // tiles per vector, 2 means head dimension is 2*16 = 32
     TORCH_CHECK(d == 32, "q.size(3) and k.size(3) should be 32");
     TORCH_CHECK(dv == 32, "v.size(3) should be 32");
