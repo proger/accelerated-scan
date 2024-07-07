@@ -137,52 +137,8 @@ def test_decay_values_forward_thr():
 #%%
 
 
-def decay_values_backward_wb1(d_out_w, k, w, beta):
-    NH, T, D = shape(None, k, None, beta)
-    S = T
-
-    K = einsum('nsd,ntd->nst', k, k) # (T,T) matrix
-
-    WB = w.new_zeros(NH, T, S, D) # d w_t / d beta_s
-    KWB = w.new_zeros(NH, S, D)
-
-    for t in range(T):
-        KWB[:, :t] = einsum('nt,ntsk->nsk', K[:, :t, t], WB[:, :t, :t])
-        WB[:, t, :t] = einsum('n,nsk->nsk', -beta[:, t], KWB[:, :t])
-        WB[:, t, t] = k[:, t] - einsum('nt,ntk->nk', K[:, :t, t], w[:, :t])
-
-    d_beta = einsum('ntk,ntsk->ns', d_out_w, WB)
-
-    return d_beta
-
-def decay_values_backward_wb2(d_out_w, k, w, beta):
-    "uses less memory than wb1, but spends more time"
-    NH, T, D = shape(None, k, None, beta)
-    assert w.shape == d_out_w.shape
-    S = T
-
-    K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
-
-    """
-    w_t = b_t k_t - b_t \sum_{s=0}^{t-1} k_s^T k_t w_s
-    """
-
-    d_beta = beta.new_zeros(NH, T)
-
-    for s in range(S):
-        WBT = w.new_zeros(NH, T, D)
-
-        WBT[:, s] += k[:, s] - einsum('ns,nsk->nk', K[:, s, :s], w[:, :s])
-        for t in range(s+1,T):
-            #WBT[:, t] += -beta[:, t] * einsum('nj,njk->nk', K[:, :t, t], WBT[:, :t])
-            WBT[:, t] = -beta[:, t] * einsum('njk,njt->nkt', WBT, K)[:, :, t]
-
-        d_beta[:, s] = einsum('ntk,ntk->n', d_out_w, WBT)
-
-    return d_beta
-
 def tileprint(K, name='K'):
-    "format matches tileprint in tk code"
+    "format matches tileprint in tk code so you can diff it"
     assert K.shape == (16, 16)
     for laneid in range(32):
         row_top = laneid // 4
@@ -206,7 +162,74 @@ def tileprint(K, name='K'):
 
 
 
-def decay_values_backward_wb3(d_out_w, k, w, beta):
+def decay_values_backward_wb1(d_out_w, d_out_u, k, v, w, u, beta):
+    NH, T, D = shape(None, k, None, beta)
+    S = T
+
+    K = einsum('nsd,ntd->nst', k, k) # (T,T) matrix
+
+    WB = w.new_zeros(NH, T, S, D) # d w_t / d beta_s
+    KWB = w.new_zeros(NH, S, D)
+
+    for t in range(T):
+        KWB[:, :t] = einsum('nt,ntsk->nsk', K[:, :t, t], WB[:, :t, :t])
+        WB[:, t, :t] = einsum('n,nsk->nsk', -beta[:, t], KWB[:, :t])
+        WB[:, t, t] = k[:, t] - einsum('nt,ntk->nk', K[:, :t, t], w[:, :t])
+
+
+    UB = u.new_zeros(NH, T, S, D) # d u_t / d beta_s
+
+    for t in range(T):
+        for s in range(t):
+            for l in range(t):
+                c = (k[:, t] * k[:, l]).sum(-1)
+                UB[:, t, s] -= einsum('n,n,nj->nj', beta[:, t], c, UB[:, l, s])
+                    
+        UB[:, t, t] = v[:, t] - einsum('ns,nsd->nd', K[:, :t, t], u[:, :t])
+
+
+    d_beta = einsum('ntk,ntsk->ns', d_out_w, WB) + einsum('ntv,ntsv->ns', d_out_u, UB)
+
+    return d_beta
+
+def decay_values_backward_wb2(d_out_w, d_out_u, k, v, w, u, beta):
+    "uses less memory than wb1, but spends more time"
+    NH, T, D = shape(None, k, None, beta)
+    assert w.shape == d_out_w.shape
+    S = T
+
+    K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
+
+    """
+    w_t = b_t k_t - b_t \sum_{s=0}^{t-1} k_s^T k_t w_s
+    """
+
+    d_beta = beta.new_zeros(NH, T)
+
+    for s in range(S):
+        WBT = w.new_zeros(NH, T, D)
+
+        WBT[:, s] += k[:, s] - einsum('ns,nsk->nk', K[:, s, :s], w[:, :s])
+        for t in range(s+1,T):
+            #WBT[:, t] += -beta[:, t] * einsum('nj,njk->nk', K[:, :t, t], WBT[:, :t])
+            WBT[:, t] = -beta[:, t] * einsum('njk,njt->nkt', WBT, K)[:, :, t]
+
+        d_beta[:, s] = einsum('ntk,ntk->n', d_out_w, WBT)
+
+
+    UB = u.new_zeros(NH, T, S, D) # d u_t / d beta_s
+    K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
+    for t in range(T):
+        for s in range(t):
+            for l in range(t):
+                UB[:, t, s] -= einsum('n,n,nj->nj', beta[:, t], K[:, t, l], UB[:, l, s])
+        UB[:, t, t] = v[:, t] - einsum('ns,nsv->nv', K[:, :t, t], u[:, :t])
+    d_beta += einsum('ntv,ntsv->ns', d_out_u, UB)
+
+    return d_beta
+
+
+def decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta):
     NH, T, D = shape(None, k, None, beta)
     assert w.shape == d_out_w.shape
     S = T
@@ -214,8 +237,9 @@ def decay_values_backward_wb3(d_out_w, k, w, beta):
     K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
     K = K.tril(diagonal=-1) # make_causal(0); set_diagonal(0)
 
-    bases = k - einsum('nts,nsk->ntk', K, w)
-    tileprint(bases[0], "bases")
+    w_bases = k - einsum('nts,nsk->ntk', K, w)
+    u_bases = v - einsum('nts,nsv->ntv', K, u)
+    tileprint(w_bases[0], "bases")
 
     K = einsum('nt,nts->nts', beta, K) # multiply each row of K by beta
     #tileprint(K[0], "Kbeta")
@@ -229,13 +253,16 @@ def decay_values_backward_wb3(d_out_w, k, w, beta):
     #d_beta = beta.new_zeros(NH, T)
     #d_beta = einsum('nts,nts->ns', decays, d_out_w_bases)
 
-    d_out_w_bases = einsum('ntk,nsk->nts', d_out_w, bases) # (T, T) matrix
+    d_out_w_bases = einsum('ntk,nsk->nts', d_out_w, w_bases) # (T, T) matrix
     d_out_w_bases *= decays
 
     #tileprint(d_out_w_bases[0], "pre_reg")
 
     d_beta = d_out_w_bases.sum(dim=1)
-    
+
+    d_out_u_bases = einsum('ntv,nsv->nts', d_out_u, u_bases) * decays # (T, T) matrix
+    d_beta += d_out_u_bases.sum(dim=1)
+
     return d_beta
 
 
@@ -244,16 +271,18 @@ def test_decay_values_backward():
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.float32)
     w, u = decay_values_forward_thr(k, v, beta)
     d_out_w = torch.randn_like(w) / D**0.5
-    d_beta = decay_values_backward_wb3(d_out_w, k, w, beta)
+    d_out_u = torch.randn_like(u) / D**0.5
+    d_beta = decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta)
 
     d_out_w1 = d_out_w.clone()
-    d_beta1 = decay_values_backward_wb2(d_out_w1, k, w, beta)
+    d_out_u1 = d_out_u.clone()
+    d_beta1 = decay_values_backward_wb2(d_out_w1, d_out_u1, k, v, w, u, beta)
 
-    # print(d_beta, 'orig')
-    # print(d_beta1, 'new')
+    print(d_beta, 'wb3')
+    print(d_beta1, 'wb2')
     assert allclose(d_beta, d_beta1, atol=1e-5), 'd_beta is wrong'
 
-#test_decay_values_backward()
+test_decay_values_backward()
 
 def test_decay_values_backward_cu():
     NH, T, D = 1, 16, 16
@@ -261,9 +290,9 @@ def test_decay_values_backward_cu():
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.bfloat16)
     w, u = decay_values_forward_thr(k, v, beta)
     d_out_w = torch.randn_like(w) / D**0.5
-    d_beta = decay_values_backward_wb3(d_out_w, k, w, beta)
+    d_out_u = torch.randn_like(u) / D**0.5
+    d_beta = decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta)
 
-    d_out_u = q.new_zeros(NH, T, D)
     d_k = k.new_zeros(NH, T, D)
     d_v = v.new_zeros(NH, T, D)
     d_beta1 = beta.new_zeros(NH, T)
