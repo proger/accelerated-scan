@@ -354,19 +354,14 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
     WK = w.new_zeros(NH, T, S, D, D) # d w_t / d k_s # ntsij
 
     for t in range(T):
-        # [s<t]
-        for s in range(t):
-            for l in range(t):
-                c = (k[:, t] * k[:, l]).sum(-1)
-                if s < l:
-                    WK[:, t, s] -= einsum('n,n,nij->nij', beta[:, t], c, WK[:, l, s])
-                if s == l:
-                    WK[:, t, s] -= einsum('n,nj,ni->nij', beta[:, t], k[:, t], w[:, s])
-                    WK[:, t, s] -= einsum('n,n,nij->nij', beta[:, t], c, WK[:, l, l])
-        # [s=t]
-    
         WK[:, t, t, arange(D), arange(D)] = beta_[:, t]
-        WK[:, t, t] += einsum('n,nsj,nsi->nij', -beta[:, t], k[:, :t], w[:, :t])
+
+    for t in range(T):
+        WK[:, t, :t] -= einsum('n,ns,nsjKk->njKk', beta[:, t], K[:,t,:], WK[:, :, :t])
+        WK[:, t, :t] -= einsum('n,nk,nsK->nsKk', beta[:, t], k[:, t], w[:, :t])
+
+        # [s=t]
+        WK[:, t, t] -= einsum('n,njk,njK->nKk', beta[:, t], k[:, :t], w[:, :t])
 
     """
     u_t = b_t v_t - b_t \sum_{s=0}^{t-1} k_s^T k_t u_s
@@ -395,18 +390,14 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
 
     UK = u.new_zeros(NH, T, S, D, DV) # d u_t / d k_s
 
+    # grad is ntv
     for t in range(T):
         # [s<t]
-        for s in range(t):
-            for l in range(t):
-                c = (k[:, t] * k[:, l]).sum(-1)
-                if s < l:
-                    UK[:, t, s] -= einsum('n,n,nij->nij', beta[:, t], c, UK[:, l, s])
-                if s == l:
-                    UK[:, t, s] -= einsum('n,nk,nv->nkv', beta[:, t], k[:, t], u[:, s])
-                    UK[:, t, s] -= einsum('n,n,nij->nij', beta[:, t], c, UK[:, l, l])
+        UK[:, t, :t] -= einsum('n,nj,njskv->nskv', beta[:, t], K[:, t, :], UK[:, :, :t])
+        UK[:, t, :t] -= einsum('n,nk,nsv->nskv', beta[:, t], k[:, t], u[:, :t])
+
         # [s=t]
-        UK[:, t, t] -= einsum('n,nsk,nsv->nkv', beta[:, t], k[:, :t], u[:, :t])
+        UK[:, t, t] -= einsum('n,njk,njv->nkv', beta[:, t], k[:, :t], u[:, :t])
 
     UB = u.new_zeros(NH, T, S, D) # d u_t / d beta_s
 
