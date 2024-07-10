@@ -257,10 +257,9 @@ def decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta):
     NH, T, D = shape(None, k, None, beta)
     assert w.shape == d_out_w.shape
     S = T
-    DV = D
 
     #
-    # d_beta
+    # d_beta (BPTT below)
     #
 
     K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
@@ -270,64 +269,66 @@ def decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta):
     w_bases = k - Kw
     u_bases = v - einsum('nts,nsv->ntv', K, u)
 
-    K = einsum('nt,nts->nts', beta, K) # multiply each row of K by beta
+    K = einsum('nt,nts->nts', -beta, K) # multiply each row of K by -beta
 
-    decays = k.new_zeros(NH, T, S) # (T, T) matrix
+    if False:
+        decays = k.new_zeros(NH, T, S) # (T, T) matrix
 
-    for t in range(T):
-        decays[:, t, t] = 1 # add_diagonal(1)
-        pre = einsum('ntj,njs->nts', K, decays)[:, t, :]
-        decays[:, t, :] -= pre
+        for t in range(T):
+            decays[:, t, t] = 1 # add_diagonal(1)
+            pre = einsum('ntj,njs->nts', -K, decays)[:, t, :]
+            decays[:, t, :] += pre
 
-    d_out_w_bases = einsum('ntk,nsk->nts', d_out_w, w_bases) # (T, T) matrix
-    d_out_w_bases *= decays
-
-    d_beta = d_out_w_bases.sum(dim=1)
-
-    d_out_u_bases = einsum('ntv,nsv->nts', d_out_u, u_bases) * decays # (T, T) matrix
-    d_beta += d_out_u_bases.sum(dim=1)
+        d_out_w_bases = einsum('ntk,nsk->nts', d_out_w, w_bases) * decays # (T, T) matrix
+        d_out_u_bases = einsum('ntv,nsv->nts', d_out_u, u_bases) * decays # (T, T) matrix
+        d_beta = d_out_w_bases.sum(dim=1) + d_out_u_bases.sum(dim=1)
 
     #
-    # d_v
+    # d_v (BPTT below)
     #
 
-    UV = u.new_zeros(NH, T, S) # d u_t / d v_s
-    beta_ = beta.unsqueeze(-1)
-    for t in range(T):
-        pre = einsum('njt,nts->njs', K, UV)[:, t]
-        UV[:, t] -= pre
-        UV[:, t, t] = beta_[:, t]
+    if False:
+        UV = u.new_zeros(NH, T, S) # d u_t / d v_s
+        for t in range(T):
+            pre = einsum('njt,nts->njs', K, UV)[:, t]
+            UV[:, t] += pre
+            UV[:, t, t] = beta[:, t]
 
-    d_v = einsum('ntv,nts->nsv', d_out_u, UV) # sum T out
+        d_v = einsum('ntv,nts->nsv', d_out_u, UV) # sum T out
 
     #
-    # d_k
+    # d_beta, d_k, d_v using BPTT
     #
 
     d_k = k.new_zeros(NH, S, D) # nsk
+    d_beta = beta.new_zeros(NH, S) # ALT d_beta: ns
+    d_v = v.new_zeros(NH, S, D) # ALT d_v: nsv
     d_out_w_backward = d_out_w.clone() # ntk
     d_out_u_backward = d_out_u.clone() # ntw
 
     eye = torch.eye(D, device=k.device, dtype=k.dtype)
     eye = eye.unsqueeze(0).expand(NH, D, D)
 
-    K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
-    K = K.tril(diagonal=-1) # make_causal(0); set_diagonal(0)
-    K = einsum('nt,nts->nts', beta, K) # multiply each row of K by beta
-
     for t in range(T-1,-1,-1):        
         # [s=t] # d w_t / d k_t
-        wst = beta_[:, t]*eye - einsum('n,njk,njw->nwk', beta[:, t], k[:, :t], w[:, :t])
+        wst = einsum('n,nts->nts', beta[:, t], eye) - einsum('n,njk,njw->nwk', beta[:, t], k[:, :t], w[:, :t])
         d_k[:,  t] += einsum('nw,nwk->nk', d_out_w_backward[:, t], wst)
 
         ust = einsum('n,njk,njw->nwk', -beta[:, t], k[:, :t], u[:, :t])
         d_k[:,  t] += einsum('nw,nwk->nk', d_out_u_backward[:, t], ust)
-
+        
         d_k[:, :t] += einsum('n,nk,nsw,nw->nsk', -beta[:, t], k[:,  t], w[:, :t], d_out_w_backward[:, t])
-        d_out_w_backward[:, :t, :] += einsum('nj,nk->njk', -K[:, t, :t], d_out_w_backward[:, t, :])
-
         d_k[:, :t] += einsum('n,nk,nsw,nw->nsk', -beta[:, t], k[:,  t], u[:, :t], d_out_u_backward[:, t])
-        d_out_u_backward[:, :t, :] += einsum('nj,nk->njk', -K[:, t, :t], d_out_u_backward[:, t, :])
+
+        # ALT d_beta
+        d_beta[:, t] += einsum('nk,nk->n', w_bases[:, t], d_out_w_backward[:, t])
+        d_beta[:, t] += einsum('nk,nk->n', u_bases[:, t], d_out_u_backward[:, t])
+
+        # ALT d_v
+        d_v[:, t] = einsum('n,nv->nv', beta[:, t], d_out_u_backward[:, t])
+
+        d_out_w_backward[:, :t, :] += einsum('nj,nk->njk', K[:, t, :t], d_out_w_backward[:, t, :])
+        d_out_u_backward[:, :t, :] += einsum('nj,nk->njk', K[:, t, :t], d_out_u_backward[:, t, :])
 
     return d_beta, d_k, d_v
 
