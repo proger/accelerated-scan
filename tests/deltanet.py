@@ -346,16 +346,16 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
         d_k[:, :t] -= einsum('nk,ns->nsk', bk[:, t], decay_w)
         d_k[:, :t] -= einsum('nk,ns->nsk', bk[:, t], decay_u)
 
-        # d_beta
-        d_beta[:, t] += einsum('nk,nk->n', w_bases[:, t], d_out_w_backward[:, t])
-        d_beta[:, t] += einsum('nk,nk->n', u_bases[:, t], d_out_u_backward[:, t])
-
-        # d_v
-        d_v[:, t] = einsum('n,nv->nv', beta[:, t], d_out_u_backward[:, t])
- 
         # backpropagate through time
         d_out_w_backward[:, :t] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_w_backward[:, t])
         d_out_u_backward[:, :t] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_u_backward[:, t])
+
+    # d_beta
+    d_beta += einsum('ntk,ntk->nt', w_bases, d_out_w_backward)
+    d_beta += einsum('ntk,ntk->nt', u_bases, d_out_u_backward)
+
+    # d_v
+    d_v = einsum('nt,ntv->ntv', beta, d_out_u_backward)
 
     return d_k, d_v, d_beta
 
