@@ -342,26 +342,31 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
         WB[:, t, t] = k[:, t] - einsum('nt,ntk->nk', K[:, :t, t], w[:, :t])
 
 
-    """
-    w_0 = b_0 k_0
-    w_1 = b_1 k_1 - b_1 k_0^T k_1 w_0
-    w_2 = b_2 k_2 - b_2 k_0^T k_2 w_0 - b_2 k_1^T k_2 w_1
-    w_t = b_t k_t - b_t \sum_{s=0}^{t-1} k_s^T k_t w_s
+    d_k = k.new_zeros(NH, S, D) # nsk
+    d_out_w_backward = d_out_w.clone() # ntk
+    d_out_u_backward = d_out_u.clone() # ntw
 
-    u_t = b_t v_t - b_t \sum_{s=0}^{t-1} k_s^T k_t u_s
-    """
+    eye = torch.eye(D, device=k.device, dtype=k.dtype)
+    eye = eye.unsqueeze(0).expand(NH, D, D)
 
-    WK = w.new_zeros(NH, T, S, D, D) # d w_t / d k_s # ntsij
+    bKl = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
+    bKl = K.tril(diagonal=-1) # make_causal(0); set_diagonal(0)
+    bKl = einsum('nt,nts->nts', -beta, K) # multiply each row of K by -beta
 
-    for t in range(T):
-        WK[:, t, t, arange(D), arange(D)] = beta_[:, t]
+    for t in range(T-1,-1,-1):        
+        # [s=t] # d w_t / d k_t
+        wst = einsum('n,nts->nts', beta[:, t], eye) - einsum('n,njk,njw->nwk', beta[:, t], k[:, :t], w[:, :t])
+        d_k[:,  t] += einsum('nw,nwk->nk', d_out_w_backward[:, t], wst)
 
-    for t in range(T):
-        WK[:, t, :t] -= einsum('n,ns,nsjKk->njKk', beta[:, t], K[:,t,:], WK[:, :, :t])
-        WK[:, t, :t] -= einsum('n,nk,nsK->nsKk', beta[:, t], k[:, t], w[:, :t])
+        ust = einsum('n,njk,njw->nwk', -beta[:, t], k[:, :t], u[:, :t])
+        d_k[:,  t] += einsum('nw,nwk->nk', d_out_u_backward[:, t], ust)
 
-        # [s=t]
-        WK[:, t, t] -= einsum('n,njk,njK->nKk', beta[:, t], k[:, :t], w[:, :t])
+        d_k[:, :t] += einsum('n,nk,nsw,nw->nsk', -beta[:, t], k[:,  t], w[:, :t], d_out_w_backward[:, t])
+        d_out_w_backward[:, :t, :] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_w_backward[:, t, :])
+
+        d_k[:, :t] += einsum('n,nk,nsw,nw->nsk', -beta[:, t], k[:,  t], u[:, :t], d_out_u_backward[:, t])
+        d_out_u_backward[:, :t, :] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_u_backward[:, t, :])
+
 
     """
     u_t = b_t v_t - b_t \sum_{s=0}^{t-1} k_s^T k_t u_s
@@ -379,26 +384,6 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
         # [s=t]
         UV[:, t, t] = beta_[:, t]
 
-    """
-    d u_t / d k_s =
-        - b_t \sum_{l=0}^{t-1} (D_{k_s} k_l^T k_t u_l)
-
-    D_{k_s} k_l^T k_t u_l = [s=t] k_l u_l^T # sum out dimensions of u_j after the outer product?
-    D_{k_s} k_l^T k_t u_l = [s<t][s<l]: only u_l is a function of k_s
-                            [s<t][s=l]: product rule for u_l(k_s) and k_l=k_s
-    """
-
-    UK = u.new_zeros(NH, T, S, D, DV) # d u_t / d k_s
-
-    # grad is ntv
-    for t in range(T):
-        # [s<t]
-        UK[:, t, :t] -= einsum('n,nj,njskv->nskv', beta[:, t], K[:, t, :], UK[:, :, :t])
-        UK[:, t, :t] -= einsum('n,nk,nsv->nskv', beta[:, t], k[:, t], u[:, :t])
-
-        # [s=t]
-        UK[:, t, t] -= einsum('n,njk,njv->nkv', beta[:, t], k[:, :t], u[:, :t])
-
     UB = u.new_zeros(NH, T, S, D) # d u_t / d beta_s
 
     for t in range(T):
@@ -410,7 +395,6 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
         UB[:, t, t] = v[:, t] - einsum('ns,nsd->nd', K[:, :t, t], u[:, :t])
 
     d_beta = einsum('ntk,ntsk->ns', d_out_w, WB) + einsum('ntv,ntsv->ns', d_out_u, UB) # sum T and D out
-    d_k = einsum('nti,ntsij->nsj', d_out_w, WK) + einsum('ntv,ntskv->nsk', d_out_u, UK) # sum T out
     d_v = einsum('ntv,ntsv->nsv', d_out_u, UV) # sum T out
 
     return d_k, d_v, d_beta
