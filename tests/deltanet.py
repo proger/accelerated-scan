@@ -320,34 +320,42 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
     w_bases = k - einsum('nts,nsk->ntk', K, w)
     u_bases = v - einsum('nts,nsw->ntw', K, u)
 
+    w0 = w.clone() # we will be mutating these, but the kernel also returns the original w and u
+    u0 = u.clone()
+
+    d_out_w_backward = d_out_w.clone() # ntk
+    d_out_u_backward = d_out_u.clone() # ntw
+
     for t in range(T-1,-1,-1):
-        wk = einsum('njw,njk->nwk', w[:, :t], k[:, :t])
+        w[:, t, :] = 0
+        k[:, t, :] = 0
+        u[:, t, :] = 0
+        wk = einsum('njw,njk->nwk', w, k)
         wk = eye - wk
-        uk = einsum('njw,njk->nwk', u[:, :t], k[:, :t])
+        wk = einsum('n,nwk->nwk', beta[:, t], wk)
+        uk = einsum('njw,njk->nwk', u, k)
+        uk = einsum('n,nwk->nwk', beta[:, t], uk)
 
         # d_k
-        wst = einsum('n,nwk->nwk', beta[:, t], wk)
-        d_k[:,  t] += einsum('nw,nwk->nk', d_out_w[:, t], wst)
+        d_k[:,  t] += einsum('nw,nwk->nk', d_out_w_backward[:, t], wk)
+        d_k[:,  t] -= einsum('nw,nwk->nk', d_out_u_backward[:, t], uk)
 
-        ust = einsum('n,nwk->nwk', beta[:, t], uk)
-        d_k[:,  t] -= einsum('nw,nwk->nk', d_out_u[:, t], ust)
-
-        decay_w = einsum('nw,nsw->ns', d_out_w[:, t], w[:, :t])
-        decay_u = einsum('nw,nsw->ns', d_out_u[:, t], u[:, :t])
+        decay_w = einsum('nw,nsw->ns', d_out_w_backward[:, t], w[:, :t])
+        decay_u = einsum('nw,nsw->ns', d_out_u_backward[:, t], u[:, :t])
 
         d_k[:, :t] -= einsum('nk,ns->nsk', bk[:, t], decay_w)
         d_k[:, :t] -= einsum('nk,ns->nsk', bk[:, t], decay_u)
 
         # d_beta
-        d_beta[:, t] += einsum('nk,nk->n', w_bases[:, t], d_out_w[:, t])
-        d_beta[:, t] += einsum('nk,nk->n', u_bases[:, t], d_out_u[:, t])
+        d_beta[:, t] += einsum('nk,nk->n', w_bases[:, t], d_out_w_backward[:, t])
+        d_beta[:, t] += einsum('nk,nk->n', u_bases[:, t], d_out_u_backward[:, t])
 
         # d_v
-        d_v[:, t] = einsum('n,nv->nv', beta[:, t], d_out_u[:, t])
-
+        d_v[:, t] = einsum('n,nv->nv', beta[:, t], d_out_u_backward[:, t])
+ 
         # backpropagate through time
-        d_out_w += einsum('nj,nk->njk', bKl[:, t, :], d_out_w[:, t])
-        d_out_u += einsum('nj,nk->njk', bKl[:, t, :], d_out_u[:, t])
+        d_out_w_backward[:, :t] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_w_backward[:, t])
+        d_out_u_backward[:, :t] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_u_backward[:, t])
 
     return d_k, d_v, d_beta
 
@@ -366,31 +374,31 @@ class DecayValues(torch.autograd.Function):
 
 
 def test_equal_decay_values_backward():
-    NH, T, D = 1, 4, 3
+    NH, T, D = 1, 16, 3
 
     q, k, v, beta = make_example(NH, T, D)
     w, u = decay_values(k, v, beta)
-    #(w + u - torch.ones_like(w)).pow(2).mean().backward()
-    (w - torch.ones_like(w)).pow(2).mean().backward()
+    (w + u - torch.ones_like(w)).pow(2).mean().backward()
+    #(w - torch.ones_like(w)).pow(2).mean().backward()
 
     q1, k1, v1, beta1 = make_example(NH, T, D)
     w1, u1 = DecayValues.apply(k1, v1, beta1)
-    #(w1 + u1 - torch.ones_like(w1)).pow(2).mean().backward()
-    (w1 - torch.ones_like(w1)).pow(2).mean().backward()
+    (w1 + u1 - torch.ones_like(w1)).pow(2).mean().backward()
+    #(w1 - torch.ones_like(w1)).pow(2).mean().backward()
 
     # print(v.grad, 'v.grad', v.grad.shape)
     # print(v1.grad, 'v1.grad')
     # print(v.grad - v1.grad, 'v diff')
-    # assert allclose(v.grad, v1.grad, atol=1e-5), 'v1_grad is wrong'
-
-    print(k.grad, 'k.grad du')
-    print(k1.grad, 'k1.grad du')
-    print(k.grad - k1.grad, 'diff du')
-    assert allclose(k.grad, k1.grad, atol=1e-5), 'k1_grad is wrong'
+    assert allclose(v.grad, v1.grad, atol=1e-5), 'v1_grad is wrong'
 
     # print(beta.grad, 'beta.grad du')
     # print(beta1.grad, 'beta1.grad du')
     assert allclose(beta.grad, beta1.grad, atol=1e-5), 'beta1.grad is wrong'
+
+    # print(k.grad, 'k.grad du')
+    # print(k1.grad, 'k1.grad du')
+    # print(k.grad - k1.grad, 'diff du')
+    assert allclose(k.grad, k1.grad, atol=1e-5), 'k1_grad is wrong'
 
 test_equal_decay_values_backward()
 
