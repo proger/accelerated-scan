@@ -258,10 +258,6 @@ def decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta):
     assert w.shape == d_out_w.shape
     S = T
 
-    #
-    # d_beta (BPTT below)
-    #
-
     K = einsum('nsd,ntd->nts', k, k) # (T,T) matrix
     K = K.tril(diagonal=-1) # make_causal(0); set_diagonal(0)
 
@@ -270,31 +266,6 @@ def decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta):
     u_bases = v - einsum('nts,nsv->ntv', K, u)
 
     K = einsum('nt,nts->nts', -beta, K) # multiply each row of K by -beta
-
-    if False:
-        decays = k.new_zeros(NH, T, S) # (T, T) matrix
-
-        for t in range(T):
-            decays[:, t, t] = 1 # add_diagonal(1)
-            pre = einsum('ntj,njs->nts', -K, decays)[:, t, :]
-            decays[:, t, :] += pre
-
-        d_out_w_bases = einsum('ntk,nsk->nts', d_out_w, w_bases) * decays # (T, T) matrix
-        d_out_u_bases = einsum('ntv,nsv->nts', d_out_u, u_bases) * decays # (T, T) matrix
-        d_beta = d_out_w_bases.sum(dim=1) + d_out_u_bases.sum(dim=1)
-
-    #
-    # d_v (BPTT below)
-    #
-
-    if False:
-        UV = u.new_zeros(NH, T, S) # d u_t / d v_s
-        for t in range(T):
-            pre = einsum('njt,nts->njs', K, UV)[:, t]
-            UV[:, t] += pre
-            UV[:, t, t] = beta[:, t]
-
-        d_v = einsum('ntv,nts->nsv', d_out_u, UV) # sum T out
 
     #
     # d_beta, d_k, d_v using BPTT
