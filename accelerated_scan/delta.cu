@@ -158,6 +158,20 @@ __device__ void vecprint(rv<bf16_2, 1, 1> reg, char *name) {
     printf("warpid=%d tid=%d %s[0] = {%f,%f}\n", warpid, threadIdx.x, name, item0.x, item0.y);
 }
 
+__device__ void vecprint(rv<bf16_2, 8, 2> reg, char *name) {
+    auto warpid        = kittens::warpid();
+
+    #pragma unroll
+    for(int i = 0; i < reg.outer_dim; i++) {
+        #pragma unroll
+        for(int j = 0; j < reg.inner_dim; j++) {
+            auto item = __bfloat1622float2(reg.data[i][j]);
+            printf("warpid=%d tid=%d %s[%d][%d] = {%f,%f}\n", warpid, threadIdx.x, name, i, j, item.x, item.y);
+        }
+    }
+}
+
+
 
 template <typename H = c10::BFloat16, int _time, int _key, int _value, int kNumWarps = 8, typename T = bf16, typename T2 = bf16_2>
 __global__ void decay_values_backward_kernel(
@@ -200,8 +214,6 @@ __global__ void decay_values_backward_kernel(
     rt<T2, _time, _key> k_reg, d_out_w_reg;
     rt<T2, _time, _value> v_reg;
     typename rt<T2, _time, _key>::col_vec beta_reg;
-    typename rt<T2, _time, _key>::row_vec d_beta_reg;
-
     rt<T2, _time, _key> w_reg, w_bases_reg, bk_reg, d_k_reg, tk_reg;
     rt<T2, _time, _value> u_reg, u_bases_reg;
     rt<T2, _time, _time> tt_reg, bKl_reg;
@@ -333,9 +345,6 @@ __global__ void decay_values_backward_kernel(
    
             copy(tk_reg, mma_TD);
             op_singlerow<base_ops::sum>(d_k_reg, d_k_reg, tk_reg, t);
-
-            printf("laneid=%d t=%d\n", laneid(), t);
-            tileprint(tk_reg, "tk");
         }
 
         k_reg = swap_layout_inplace(k_reg_col);
@@ -369,8 +378,6 @@ __global__ void decay_values_backward_kernel(
 
     }
 
-    tileprint(d_k_reg, "DK");
-
     __syncthreads();
 
     sub(d_k_reg, d_out_w_reg, d_k_reg); // d_k = d_out_w - d_k
@@ -401,9 +408,10 @@ __global__ void decay_values_backward_kernel(
     mul_row(d_out_u_reg, d_out_u_reg, beta_reg);
     store(_d_v, d_out_u_reg, d_out_u_reg.cols);
 
-    // continue d_beta reusing the beta register
+    // continue d_beta
     rt<T2, _time, _key, ducks::rt_layout::col> &w_bases_col = swap_layout_inplace(w_bases_reg);
     rt<T2, _time, _value, ducks::rt_layout::col> &u_bases_col = swap_layout_inplace(u_bases_reg);
+    rv<T2, _time, 2> d_beta_reg;
     zero(d_beta_reg);
     row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
     row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
@@ -452,7 +460,7 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
     // using H = float;
     // using T2 = float2;
     constexpr int kHeight = 1; // tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
-    constexpr int kWidth = 1; // tiles per vector, 2 means head dimension is 2*16 = 32
+    constexpr int kWidth = 4; // tiles per vector, 2 means head dimension is 2*16 = 32
     TORCH_CHECK(d == kWidth * 16, "q.size(3) and k.size(3) should be kWidth*16");
     TORCH_CHECK(dv == kWidth * 16, "v.size(3) should be kWidth*16");
 

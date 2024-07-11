@@ -358,8 +358,6 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
         tt[:, t:, :] = 0
         tk += einsum('njt,njk->ntk', tt, k)
 
-        print(tk, 'tk', t)
-
         d_k[:, t] += tk[:, t]
 
         # backpropagate through time, updating only remaining timestamps

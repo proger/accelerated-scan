@@ -334,7 +334,7 @@ def test_decay_values_backward():
 test_decay_values_backward()
 
 def test_decay_values_backward_cu():
-    NH, T, D = 1, 16, 16
+    NH, T, D = 1, 16, 64
 
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.bfloat16)
     w, u = decay_values_forward_thr(k, v, beta)
