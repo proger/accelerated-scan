@@ -172,6 +172,94 @@ __device__ void vecprint(rv<bf16_2, 8, 2> reg, char *name) {
 }
 
 
+template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8>
+__global__ void decay_values_forward_kernel(
+    int seqlen,
+    const H* __restrict__ __k__,
+    const H* __restrict__ __v__,
+    const H* __restrict__ __beta__,
+    H* __restrict__ __w__,
+    H* __restrict__ __u__
+) {
+    auto warpid           = kittens::warpid();
+    auto block_start      = blockIdx.x*(seqlen*_key*TILE_DIM);
+    auto beta_block_start = blockIdx.x*(seqlen*TILE_DIM); // width is 1 for beta
+    const T *_k = reinterpret_cast<const T *>(__k__) + block_start,
+            *_v = reinterpret_cast<const T *>(__v__) + block_start,
+            *_beta = reinterpret_cast<const T *>(__beta__) + beta_block_start;
+          T *_w = reinterpret_cast<T *>(__w__) + block_start,
+            *_u = reinterpret_cast<T *>(__u__) + block_start;
+    
+    /*
+     * register allocations
+     */
+    rt<D, _time, _key> k_reg, w_reg, tk_reg;
+    rt<D, _time, _value> v_reg, u_reg;
+    typename rt<D, _time, _key>::col_vec beta_reg;
+    rt<D, _time, _time> tt_reg;
+
+    rt<ACCUM, _time, _time> mma_TT;
+    rt<ACCUM, _time, _key> mma_TD;
+
+    const int time_blocks = seqlen / (w_reg.rows*kNumWarps);
+    int time_warp_index = warpid; // TODO
+
+    /*
+     * load k, v, beta
+     */
+
+    load(k_reg, _k + time_warp_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
+    load(v_reg, _v + time_warp_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
+    load(beta_reg, _beta + time_warp_index); // beta = beta.clone()
+
+    /*
+     * decay_values_forward: compute w and u
+     */
+
+    __syncthreads();
+
+    zero(mma_TT);
+    mma_ABt(mma_TT, k_reg, k_reg, mma_TT); // tt = einsum('ntd,nsd->nts', k, k)
+    copy(tt_reg, mma_TT);
+    make_causal(tt_reg, tt_reg, 0);
+    set_diagonal(tt_reg, tt_reg, 0); // tt = tt.tril(diagonal=-1)
+    mul_row(tt_reg, tt_reg, beta_reg); // tt = einsum('nts,nt->nts', tt, beta)
+
+    zero(w_reg);
+    zero(u_reg);
+    mul_row(v_reg, v_reg, beta_reg); // v = einsum('ntw,nt->ntw', v, beta)
+    mul_row(k_reg, k_reg, beta_reg); // k = einsum('ntk,nt->ntk', k, beta)
+
+    for (auto t = 0; t < w_reg.rows; t++) {
+        __syncthreads();
+
+        {
+            zero(mma_TD);
+            rt<D, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
+            mma_AB(mma_TD, tt_reg, w_reg_col, mma_TD);
+            w_reg = swap_layout_inplace(w_reg_col);
+            copy(tk_reg, mma_TD);
+            op_singlerow<base_ops::sub>(w_reg, k_reg, tk_reg, t); // w[t] = bk[t] - tk[t]
+        }
+
+        __syncthreads();
+    
+        {
+            zero(mma_TD);
+            rt<D, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
+            mma_AB(mma_TD, tt_reg, u_reg_col, mma_TD); // (T,S) (S,D) -> (T,D)
+            u_reg = swap_layout_inplace(u_reg_col);
+            copy(tk_reg, mma_TD);
+            op_singlerow<base_ops::sub>(u_reg, v_reg, tk_reg, t); // u[t] = bv[t] - tk[t]
+        }
+    }
+
+    __syncthreads();
+
+    store(_w, w_reg, w_reg.cols);
+    store(_u, u_reg, u_reg.cols);
+}
+
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8>
 __global__ void decay_values_backward_kernel(
@@ -420,6 +508,82 @@ __global__ void decay_values_backward_kernel(
     store(_d_beta, d_beta_reg);
 }
 
+// see also: DISPATCH
+#define TYPE_DISPATCH(scalar_type, FUNC)\
+    switch (scalar_type) {\
+        case c10::ScalarType::BFloat16: {\
+            using H = c10::BFloat16;\
+            using T = bf16;\
+            using D = bf16_2;\
+            using ACCUM = float2;\
+            FUNC;\
+        }\
+            break;\
+        default:\
+            TORCH_CHECK(false, "Unsupported type! Try bfloat16");\
+    }
+
+#define DISPATCH_ME(d, seqlen) \
+    if (d == 64) { \
+        if (seqlen == 16) { \
+            TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 4, 1)); \
+        } else { \
+            TORCH_CHECK(false, "[kvb].size(1) should be 16"); \
+        } \
+    } else if (d == 128) { \
+        if (seqlen == 16) { \
+            TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 8, 1)); \
+        } else { \
+            TORCH_CHECK(false, "[kvb].size(1) should be 16"); \
+        } \
+    } else { \
+        TORCH_CHECK(false, "[qkv].size(2) should be 64 or 128"); \
+    }
+
+void
+decay_values_forward(torch::Tensor k, torch::Tensor v, torch::Tensor beta, torch::Tensor w, torch::Tensor u) {
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    CHECK_INPUT(beta);
+    CHECK_INPUT(w);
+    CHECK_INPUT(u);
+
+    auto scalar_type = k.scalar_type();
+    TORCH_CHECK(v.scalar_type() == scalar_type, "v type mismatch");
+    TORCH_CHECK(beta.scalar_type() == scalar_type, "beta type mismatch");
+    TORCH_CHECK(w.scalar_type() == scalar_type, "w type mismatch");
+    TORCH_CHECK(u.scalar_type() == scalar_type, "u type mismatch");
+
+    auto batch_head = k.size(0);
+    auto seqlen = k.size(1);
+    auto d      = k.size(2);
+    bool same = true;
+    for(auto i = 0; i < 3; i++) { 
+        same &= k.size(i) == v.size(i);
+        //same &= q.size(i) == v.size(i);
+    }
+    TORCH_CHECK(same, "K and V should be same size");
+
+    // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
+    // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
+#define DELTA_DISPATCH(_kHeight, _kWidth, _kNumWarps) \
+        constexpr int kHeight = _kHeight;  \
+        constexpr int kWidth = _kWidth; \
+        constexpr int kNumWarps = _kNumWarps; \
+        auto threads = kNumWarps * kittens::WARP_THREADS; \
+        unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
+                               + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
+                               + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
+        CHECK_CUDA_ERROR(cudaFuncSetAttribute(decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
+        decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps><<<batch_head,threads,mem_size>>>( \
+            (int)seqlen, \
+            k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
+            w.data_ptr<H>(), u.data_ptr<H>())
+
+    DISPATCH_ME(d, seqlen);
+#undef DELTA_DISPATCH
+}
+
 void
 decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
                       torch::Tensor d_k, torch::Tensor d_v, torch::Tensor d_beta, torch::Tensor w, torch::Tensor u) {
@@ -454,22 +618,6 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
         //same &= q.size(i) == v.size(i);
     }
     TORCH_CHECK(same, "K and V should be same size");
-    TORCH_CHECK(seqlen == 16, "[kvb].size(1) should be 16");
-
-    // copied from: DISPATCH
-#define TYPE_DISPATCH(scalar_type, FUNC)\
-    switch (scalar_type) {\
-        case c10::ScalarType::BFloat16: {\
-            using H = c10::BFloat16;\
-            using T = bf16;\
-            using D = bf16_2;\
-            using ACCUM = float2;\
-            FUNC;\
-        }\
-            break;\
-        default:\
-            TORCH_CHECK(false, "Unsupported type! Try bfloat16");\
-    }
 
     // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
     // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
@@ -489,11 +637,6 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
             d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \
             w.data_ptr<H>(), u.data_ptr<H>())
 
-    if (d == 64) {
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 4, 1));
-    } else if (d == 128) {
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 8, 1));
-    } else {
-        TORCH_CHECK(false, "[qkv].size(2) should be 64 or 128");
-    }
+    DISPATCH_ME(d, seqlen);
+#undef DELTA_DISPATCH
 }

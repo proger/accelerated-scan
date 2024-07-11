@@ -334,7 +334,7 @@ def test_decay_values_backward():
 test_decay_values_backward()
 
 def test_decay_values_backward_cu():
-    NH, T, D = 1, 16, 64
+    NH, T, D = 1, 16, 128
 
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.bfloat16)
     w, u = decay_values_forward_thr(k, v, beta)
@@ -354,6 +354,13 @@ def test_decay_values_backward_cu():
     u1 = u.new_zeros(NH, T, D)
     from accelerated_scan import kitten
     kitten.decay_values_backward(d_out_w.clone(), d_out_u.clone(), k, v, beta, d_k1, d_v1, d_beta1, w1, u1)
+
+    w2 = w.new_zeros(NH, T, D)
+    u2 = u.new_zeros(NH, T, D)
+    kitten.decay_values_forward(k, v, beta, w2, u2)
+
+    assert allclose(u, u2, atol=1e-5), 'u2 is wrong'
+    assert allclose(w, w2, atol=1e-5), 'w2 is wrong'
 
     assert allclose(u, u1, atol=1e-5), 'u is wrong'
     assert allclose(w, w1, atol=1e-5), 'w is wrong'
