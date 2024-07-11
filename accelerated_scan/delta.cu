@@ -160,7 +160,7 @@ __device__ void vecprint(rv<bf16_2, 1, 1> reg, char *name) {
 
 __device__ void vecprint(rv<bf16_2, 8, 2> reg, char *name) {
     auto warpid        = kittens::warpid();
-
+    
     #pragma unroll
     for(int i = 0; i < reg.outer_dim; i++) {
         #pragma unroll
@@ -173,7 +173,7 @@ __device__ void vecprint(rv<bf16_2, 8, 2> reg, char *name) {
 
 
 
-template <typename H = c10::BFloat16, int _time, int _key, int _value, int kNumWarps = 8, typename T = bf16, typename T2 = bf16_2>
+template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8>
 __global__ void decay_values_backward_kernel(
     int seqlen,
     const H* __restrict__ __d_out_w__,
@@ -211,15 +211,18 @@ __global__ void decay_values_backward_kernel(
     /*
      * register allocations
      */
-    rt<T2, _time, _key> k_reg, d_out_w_reg;
-    rt<T2, _time, _value> v_reg;
-    typename rt<T2, _time, _key>::col_vec beta_reg;
-    rt<T2, _time, _key> w_reg, w_bases_reg, bk_reg, d_k_reg, tk_reg;
-    rt<T2, _time, _value> u_reg, u_bases_reg;
-    rt<T2, _time, _time> tt_reg, bKl_reg;
+    rt<D, _time, _key> k_reg, d_out_w_reg;
+    rt<D, _time, _value> v_reg;
+    union {
+        typename rt<D, _time, _key>::col_vec beta_reg;
+        rv<D, _time, 2> d_beta_reg;
+    };
+    rt<D, _time, _key> w_reg, w_bases_reg, bk_reg, d_k_reg, tk_reg;
+    rt<D, _time, _value> u_reg, u_bases_reg;
+    rt<D, _time, _time> tt_reg, bKl_reg;
 
-    rt<float2, _time, _time> mma_TT;
-    rt<float2, _time, _key> mma_TD;
+    rt<ACCUM, _time, _time> mma_TT;
+    rt<ACCUM, _time, _key> mma_TD;
 
     const int time_blocks = seqlen / (w_reg.rows*kNumWarps);
     //printf("seqlen: %d time_blocks: %d rows: %d\n", seqlen, time_blocks, w_reg.rows);
@@ -262,7 +265,7 @@ __global__ void decay_values_backward_kernel(
 
         {
             zero(mma_TD);
-            rt<T2, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
+            rt<D, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
             mma_AB(mma_TD, bKl_reg, w_reg_col, mma_TD);
             w_reg = swap_layout_inplace(w_reg_col);
             copy(tk_reg, mma_TD);
@@ -273,7 +276,7 @@ __global__ void decay_values_backward_kernel(
     
         {
             zero(mma_TD);
-            rt<T2, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
+            rt<D, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
             mma_AB(mma_TD, bKl_reg, u_reg_col, mma_TD); // (T,S) (S,D) -> (T,D)
             u_reg = swap_layout_inplace(u_reg_col);
             copy(tk_reg, mma_TD);
@@ -288,7 +291,7 @@ __global__ void decay_values_backward_kernel(
 
     {
         zero(mma_TD);
-        rt<T2, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
+        rt<D, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
         mma_AB(mma_TD, tt_reg, w_reg_col, mma_TD); // mma_TD = einsum('nts,nsk->ntk', tt, w)
         w_reg = swap_layout_inplace(w_reg_col);
         copy(w_bases_reg, mma_TD);
@@ -297,7 +300,7 @@ __global__ void decay_values_backward_kernel(
 
     {
         zero(mma_TD);
-        rt<T2, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
+        rt<D, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
         mma_AB(mma_TD, tt_reg, u_reg_col, mma_TD); // mma_TD = einsum('nts,nsw->ntw', tt, u)
         u_reg = swap_layout_inplace(u_reg_col);
         copy(v_reg, mma_TD);
@@ -308,7 +311,7 @@ __global__ void decay_values_backward_kernel(
      * backward for d_k, d_v, d_beta
      */
 
-    rt<T2, _time, _value> &d_out_u_reg = v_reg;
+    rt<D, _time, _value> &d_out_u_reg = v_reg;
     zero(d_out_u_reg);
     load(d_out_u_reg, _d_out_u + time_warp_index*d_out_u_reg.num_elements, d_out_u_reg.cols); // d_out_u = d_out_u.clone()
     zero(d_k_reg);
@@ -316,7 +319,7 @@ __global__ void decay_values_backward_kernel(
     for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
         __syncthreads();
 
-        rt<T2, _time, _key, ducks::rt_layout::col> &k_reg_col = swap_layout_inplace(k_reg);
+        rt<D, _time, _key, ducks::rt_layout::col> &k_reg_col = swap_layout_inplace(k_reg);
 
         // d_k
         zero(mma_TD);
@@ -327,7 +330,7 @@ __global__ void decay_values_backward_kernel(
             reset_trailing_rows(tt_reg, t);
 
             {
-                rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+                rt<D, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
                 mma_AtB(mma_TD, tt_reg_col, k_reg_col, mma_TD);
                 tt_reg = swap_layout_inplace(tt_reg_col);
             }
@@ -338,7 +341,7 @@ __global__ void decay_values_backward_kernel(
             reset_trailing_rows(tt_reg, t);
 
             {
-                rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+                rt<D, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
                 mma_AtB(mma_TD, tt_reg_col, k_reg_col, mma_TD);
                 tt_reg = swap_layout_inplace(tt_reg_col);
             }
@@ -353,11 +356,11 @@ __global__ void decay_values_backward_kernel(
         {
             zero(tt_reg);
             op_singlerow<base_ops::sum>(tt_reg, tt_reg, bKl_reg, t);
-            rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+            rt<D, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
 
             {
                 zero(mma_TD);
-                rt<T2, _time, _key, ducks::rt_layout::col> &d_out_w_reg_col = swap_layout_inplace(d_out_w_reg);
+                rt<D, _time, _key, ducks::rt_layout::col> &d_out_w_reg_col = swap_layout_inplace(d_out_w_reg);
                 mma_AtB(mma_TD, tt_reg_col, d_out_w_reg_col, mma_TD);
                 d_out_w_reg = swap_layout_inplace(d_out_w_reg_col);
 
@@ -365,7 +368,7 @@ __global__ void decay_values_backward_kernel(
                 sub(d_out_w_reg, d_out_w_reg, tk_reg);
 
                 zero(mma_TD);
-                rt<T2, _time, _value, ducks::rt_layout::col> &d_out_u_reg_col = swap_layout_inplace(d_out_u_reg);
+                rt<D, _time, _value, ducks::rt_layout::col> &d_out_u_reg_col = swap_layout_inplace(d_out_u_reg);
                 mma_AtB(mma_TD, tt_reg_col, d_out_u_reg_col, mma_TD);
                 d_out_u_reg = swap_layout_inplace(d_out_u_reg_col);
 
@@ -391,8 +394,8 @@ __global__ void decay_values_backward_kernel(
     make_causal(tt_reg, tt_reg, 0);
     set_diagonal(tt_reg, tt_reg, 0);
 
-    rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
-    rt<T2, _time, _value, ducks::rt_layout::col> &bk_reg_col = swap_layout_inplace(bk_reg);
+    rt<D, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+    rt<D, _time, _value, ducks::rt_layout::col> &bk_reg_col = swap_layout_inplace(bk_reg);
     zero(mma_TD);
     mma_AtB(mma_TD, tt_reg_col, bk_reg_col, mma_TD);
     copy(tk_reg, mma_TD);
@@ -409,9 +412,8 @@ __global__ void decay_values_backward_kernel(
     store(_d_v, d_out_u_reg, d_out_u_reg.cols);
 
     // continue d_beta
-    rt<T2, _time, _key, ducks::rt_layout::col> &w_bases_col = swap_layout_inplace(w_bases_reg);
-    rt<T2, _time, _value, ducks::rt_layout::col> &u_bases_col = swap_layout_inplace(u_bases_reg);
-    rv<T2, _time, 2> d_beta_reg;
+    rt<D, _time, _key, ducks::rt_layout::col> &w_bases_col = swap_layout_inplace(w_bases_reg);
+    rt<D, _time, _value, ducks::rt_layout::col> &u_bases_col = swap_layout_inplace(u_bases_reg);
     zero(d_beta_reg);
     row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
     row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
@@ -431,63 +433,67 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
     CHECK_INPUT(d_beta);
     CHECK_INPUT(w);
     CHECK_INPUT(u);
-    
+
+    auto scalar_type = d_out_w.scalar_type();
+    TORCH_CHECK(d_out_u.scalar_type() == scalar_type, "d_out_u type mismatch");
+    TORCH_CHECK(k.scalar_type() == scalar_type, "k type mismatch");
+    TORCH_CHECK(v.scalar_type() == scalar_type, "v type mismatch");
+    TORCH_CHECK(beta.scalar_type() == scalar_type, "beta type mismatch");
+    TORCH_CHECK(d_k.scalar_type() == scalar_type, "d_k type mismatch");
+    TORCH_CHECK(d_v.scalar_type() == scalar_type, "d_v type mismatch");
+    TORCH_CHECK(d_beta.scalar_type() == scalar_type, "d_beta type mismatch");
+    TORCH_CHECK(w.scalar_type() == scalar_type, "w type mismatch");
+    TORCH_CHECK(u.scalar_type() == scalar_type, "u type mismatch");
+
     auto batch_head = k.size(0);
     auto seqlen = k.size(1);
     auto d      = k.size(2);
-    auto dv     = v.size(2);
-    bool k_same = true;
+    bool same = true;
     for(auto i = 0; i < 3; i++) { 
-        k_same &= k.size(i) == v.size(i);
+        same &= k.size(i) == v.size(i);
+        //same &= q.size(i) == v.size(i);
     }
-    // This is just a restriction of what we're doing now...
-    TORCH_CHECK(k_same, "K and V should be same size");
+    TORCH_CHECK(same, "K and V should be same size");
+    TORCH_CHECK(seqlen == 16, "[kvb].size(1) should be 16");
 
-    // TORCH_CHECK(d_out_w.scalar_type() == c10::ScalarType::BFloat16, "d_out_w is a Bfloat");
-    // TORCH_CHECK(d_out_u.scalar_type() == c10::ScalarType::BFloat16, "d_out_u is a Bfloat");
-    // TORCH_CHECK(k.scalar_type() == c10::ScalarType::BFloat16, "K is a Bfloat");
-    // TORCH_CHECK(v.scalar_type() == c10::ScalarType::BFloat16, "V is a Bfloat");
-    // TORCH_CHECK(beta.scalar_type() == c10::ScalarType::BFloat16, "beta is a Bfloat");
-    // TORCH_CHECK(d_k.scalar_type() == c10::ScalarType::BFloat16, "d_k is a Bfloat");
-    // TORCH_CHECK(d_v.scalar_type() == c10::ScalarType::BFloat16, "d_v is a Bfloat");
-    // TORCH_CHECK(d_beta.scalar_type() == c10::ScalarType::BFloat16, "d_beta is a Bfloat");
-    // TORCH_CHECK(w.scalar_type() == c10::ScalarType::BFloat16, "w is a Bfloat");
-    // TORCH_CHECK(u.scalar_type() == c10::ScalarType::BFloat16, "u is a Bfloat");
+    // copied from: DISPATCH
+#define TYPE_DISPATCH(scalar_type, FUNC)\
+    switch (scalar_type) {\
+        case c10::ScalarType::BFloat16: {\
+            using H = c10::BFloat16;\
+            using T = bf16;\
+            using D = bf16_2;\
+            using ACCUM = float2;\
+            FUNC;\
+        }\
+            break;\
+        default:\
+            TORCH_CHECK(false, "Unsupported type! Try bfloat16");\
+    }
 
-    using H = c10::BFloat16;
-    using T = bf16;
-    using T2 = bf16_2;
-    // using H = float;
-    // using T2 = float2;
-    constexpr int kHeight = 1; // tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
-    constexpr int kWidth = 4; // tiles per vector, 2 means head dimension is 2*16 = 32
-    TORCH_CHECK(d == kWidth * 16, "q.size(3) and k.size(3) should be kWidth*16");
-    TORCH_CHECK(dv == kWidth * 16, "v.size(3) should be kWidth*16");
+    // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
+    // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
+#define DELTA_DISPATCH(_kHeight, _kWidth, _kNumWarps) \
+        constexpr int kHeight = _kHeight;  \
+        constexpr int kWidth = _kWidth; \
+        constexpr int kNumWarps = _kNumWarps; \
+        auto threads = kNumWarps * kittens::WARP_THREADS; \
+        unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
+                               + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
+                               + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
+        CHECK_CUDA_ERROR(cudaFuncSetAttribute(decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
+        decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps><<<batch_head,threads,mem_size>>>( \
+            (int)seqlen, \
+            d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(), \
+            k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
+            d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \
+            w.data_ptr<H>(), u.data_ptr<H>())
 
-    constexpr int kNumWarps = 1;
-
-    // storing k, v and beta
-    unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) // k
-                           + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) // v
-                           + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) // beta
-                           ;
-
-    TORCH_CHECK(seqlen % (kNumWarps*kittens::TILE_DIM) == 0, "The number of elements should be divisible the number of warps times stored fragments");
-
-    auto threads = kNumWarps * kittens::WARP_THREADS;
-    //printf("[decay_values_backward] Requesting %lu bytes of memory for %d worker warps (%d threads)\n", mem_size, kNumWarps, threads);
-    CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-        decay_values_backward_kernel<H, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));
-    
-    decay_values_backward_kernel<H, kHeight, kWidth, kWidth, kNumWarps, T, T2><<<batch_head,threads,mem_size>>>(
-        (int)seqlen,
-        d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(),
-        k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(),
-        d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(),
-        w.data_ptr<H>(), u.data_ptr<H>());
-
-    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    if (d == 64) {
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 4, 1));
+    } else if (d == 128) {
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 8, 1));
+    } else {
+        TORCH_CHECK(false, "[qkv].size(2) should be 64 or 128");
+    }
 }
-
-//#include "harness.impl"
-    
