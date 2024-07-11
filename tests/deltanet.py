@@ -292,70 +292,108 @@ test_equal_attend_backward2()
 def decay_values_backward(d_out_w, d_out_u, k, v, beta):
     NH, T, D = shape(None, k, v, beta)
 
-    # recompute w and u TK-style
+    #
+    # allocations
+    #
+
+    # this group is loaded from global memory
+    k = k.clone() # load k
+    v = v.clone() # load v
+    beta = beta.clone() # load beta
+    d_out_w = d_out_w.clone() # ntk
+
     w = k.new_zeros(NH, T, D) # ntk
     u = v.new_zeros(NH, T, D) # ntw
+    w_bases = w.clone() # ntk
+    u_bases = u.clone() # ntw
 
     bk = einsum('nt,ntk->ntk', beta, k)
-    bv = einsum('nt,ntw->ntw', beta, v)
 
-    K = einsum('ntd,nsd->nts', k, k) # (T,T) matrix
-    K = K.tril(diagonal=-1) # make_causal(0); set_diagonal(0)
-    bKl = einsum('nt,nts->nts', -beta, K) # multiply each row of K by beta
+    bKl = k.new_zeros(NH, T, T)
+    tt = k.new_zeros(NH, T, T)
+
+    d_k = k.new_zeros(NH, T, D) # nsk
+    tk = k.new_zeros(NH, T, D) # ntk
+
+    #
+    # forward
+    #
+
+    tt = einsum('ntk,nsk->nts', k, k)
+    tt = tt.tril(diagonal=-1) # make_causal(0); set_diagonal(0)
+    bKl = einsum('nt,nts->nts', beta, tt) # multiply each row of K by beta
+
+    u_bases = v
+    v = einsum('nt,ntw->ntw', beta, v)
 
     for t in range(T):
-        c_w = einsum('nts,nsk->ntk', bKl, w)
-        w[:, t] = bk[:, t, :] + c_w[:, t, :]
-        c_u = einsum('nts,nsw->ntw', bKl, u)
-        u[:, t] = bv[:, t, :] + c_u[:, t, :]
+        tk = einsum('nts,nsk->ntk', bKl, w) # matmul for the sake of one row
+        w[:, t] = bk[:, t, :] - tk[:, t, :]
+        tk = einsum('nts,nsw->ntw', bKl, u) # matmul for the sake of one row
+        u[:, t] = v[:, t, :] - tk[:, t, :]
 
-    # compute gradients for d_k, d_v, d_beta
-    d_k = k.new_zeros(NH, T, D) # nsk
-    d_beta = beta.new_zeros(NH, T) # ns
-    d_v = v.new_zeros(NH, T, D) # nsv
+    w.clone() # store w
+    u.clone() # store u
 
-    eye = torch.eye(D, device=k.device, dtype=k.dtype)
-    eye = eye.unsqueeze(0).expand(NH, D, D)
+    w_bases = einsum('nts,nsk->ntk', tt, w)
+    w_bases = k - w_bases
+    v = einsum('nts,nsw->ntw', tt, u)
+    u_bases = u_bases - v
 
-    w_bases = k - einsum('nts,nsk->ntk', K, w)
-    u_bases = v - einsum('nts,nsw->ntw', K, u)
+    #
+    # backward for d_k, d_v, d_beta
+    #
 
-    w0 = w.clone() # we will be mutating these, but the kernel also returns the original w and u
-    u0 = u.clone()
-
-    d_out_w_backward = d_out_w.clone() # ntk
-    d_out_u_backward = d_out_u.clone() # ntw
+    v.zero_() # reuse register space of v for d_out_u
+    d_out_u = d_out_u.clone() # ntw
+    d_k.zero_()
 
     for t in range(T-1,-1,-1):
-        w[:, t, :] = 0
-        k[:, t, :] = 0
-        u[:, t, :] = 0
-        wk = einsum('njw,njk->nwk', w, k)
-        wk = eye - wk
-        wk = einsum('n,nwk->nwk', beta[:, t], wk)
-        uk = einsum('njw,njk->nwk', u, k)
-        uk = einsum('n,nwk->nwk', beta[:, t], uk)
-
         # d_k
-        d_k[:,  t] += einsum('nw,nwk->nk', d_out_w_backward[:, t], wk)
-        d_k[:,  t] -= einsum('nw,nwk->nk', d_out_u_backward[:, t], uk)
+        tt = einsum('njw,ntw->njt', w, d_out_w) # matmul for the sake of one column t
+        tt[:, t:, :] = 0
+        tk = einsum('njt,njk->ntk', tt, k)
 
-        decay_w = einsum('nw,nsw->ns', d_out_w_backward[:, t], w[:, :t])
-        decay_u = einsum('nw,nsw->ns', d_out_u_backward[:, t], u[:, :t])
+        tt = einsum('njv,ntv->njt', u, d_out_u) # matmul for the sake of one column t
+        tt[:, t:, :] = 0
+        tk += einsum('njt,njk->ntk', tt, k)
 
-        d_k[:, :t] -= einsum('nk,ns->nsk', bk[:, t], decay_w)
-        d_k[:, :t] -= einsum('nk,ns->nsk', bk[:, t], decay_u)
+        print(tk, 'tk', t)
 
-        # backpropagate through time
-        d_out_w_backward[:, :t] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_w_backward[:, t])
-        d_out_u_backward[:, :t] += einsum('nj,nk->njk', bKl[:, t, :t], d_out_u_backward[:, t])
+        d_k[:, t] += tk[:, t]
+
+        # backpropagate through time, updating only remaining timestamps
+        tt.zero_()
+        tt[:, t] += bKl[:, t]
+        tk = einsum('ntj,ntk->njk', tt, d_out_w)
+        d_out_w = d_out_w - tk
+        tk = einsum('ntj,ntk->njk', tt, d_out_u)
+        d_out_u = d_out_u - tk
+
+    d_k = d_out_w - d_k
+    d_k = einsum('ntk,nt->ntk', d_k, beta)
+
+    # decay w and u
+    tt = einsum('ntw,njw->ntj', d_out_w, w)
+    tt += einsum('ntw,njw->ntj', d_out_u, u)
+    tt.tril_(diagonal=-1)
+
+    tk = einsum('ntj,ntk->njk', tt, bk)
+    d_k = d_k - tk
+    d_k = d_k.clone() # store
 
     # d_beta
-    d_beta += einsum('ntk,ntk->nt', w_bases, d_out_w_backward)
-    d_beta += einsum('ntk,ntk->nt', u_bases, d_out_u_backward)
+    w_bases = einsum('ntk,ntk->ntk', w_bases, d_out_w)
+    u_bases = einsum('ntw,ntw->ntw', u_bases, d_out_u)
 
-    # d_v
-    d_v = einsum('nt,ntv->ntv', beta, d_out_u_backward)
+    # d_v using d_out_u register
+    d_out_u = einsum('nt,ntv->ntv', beta, d_out_u)
+    d_v = d_out_u.clone() # store
+
+    # continue d_beta reusing the beta register
+    beta = einsum('ntk->nt', w_bases)
+    beta += einsum('ntv->nt', u_bases)
+    d_beta = beta.clone() # store
 
     return d_k, d_v, d_beta
 
@@ -374,7 +412,7 @@ class DecayValues(torch.autograd.Function):
 
 
 def test_equal_decay_values_backward():
-    NH, T, D = 1, 16, 3
+    NH, T, D = 1, 16, 16
 
     q, k, v, beta = make_example(NH, T, D)
     w, u = decay_values(k, v, beta)

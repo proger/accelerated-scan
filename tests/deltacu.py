@@ -304,6 +304,8 @@ def decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta):
     return d_beta, d_k, d_v
 
 
+from tests.deltanet import decay_values_backward as decay_values_backward_ref
+
 def test_decay_values_backward():
     NH, T, D = 1, 16, 16
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.float32)
@@ -338,21 +340,35 @@ def test_decay_values_backward_cu():
     w, u = decay_values_forward_thr(k, v, beta)
     d_out_w = torch.randn_like(w) / D**0.5
     d_out_u = torch.randn_like(u) / D**0.5
-    d_beta = decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta)
+    d_beta, d_k, d_v = decay_values_backward_wb3(d_out_w, d_out_u, k, v, w, u, beta)
 
-    d_k = k.new_zeros(NH, T, D)
-    d_v = v.new_zeros(NH, T, D)
+    d_k0, d_v0, d_beta0 = decay_values_backward_ref(d_out_w.clone(), d_out_u.clone(), k, v, beta)
+    # assert allclose(d_k, d_k0, atol=1e-5), 'd_k is wrong'
+    # assert allclose(d_v, d_v0, atol=1e-5), 'd_v is wrong'
+    # assert allclose(d_beta, d_beta0, atol=1e-5), 'd_beta is wrong'
+
+    d_k1 = k.new_zeros(NH, T, D)
+    d_v1 = v.new_zeros(NH, T, D)
     d_beta1 = beta.new_zeros(NH, T)
     w1 = w.new_zeros(NH, T, D)
     u1 = u.new_zeros(NH, T, D)
     from accelerated_scan import kitten
-    kitten.decay_values_backward(d_out_w, d_out_u, k, v, beta, d_k, d_v, d_beta1, w1, u1)
+    kitten.decay_values_backward(d_out_w.clone(), d_out_u.clone(), k, v, beta, d_k1, d_v1, d_beta1, w1, u1)
 
     assert allclose(u, u1, atol=1e-5), 'u is wrong'
     assert allclose(w, w1, atol=1e-5), 'w is wrong'
-    print(d_beta, 'ref')
+
+
+    print(d_k0, 'd_k ref')
+    print(d_k1, 'd_k hyp')
+    print(d_k1 - d_k0, 'd_k diff')
+    assert allclose(d_k0, d_k1, atol=1e-3), 'd_k is wrong'
+    assert allclose(d_v0, d_v1, atol=1e-5), 'd_v is wrong'
+
+    print(d_beta0, 'ref')
     print(d_beta1, 'hyp')
     # XXX: atol=1e-2 might be too low. cast to float32?
-    assert allclose(d_beta, d_beta1, atol=1e-2), 'd_beta is wrong'
+    assert allclose(d_beta0, d_beta1, atol=1e-2), 'd_beta is wrong'
+    
 
 test_decay_values_backward_cu()

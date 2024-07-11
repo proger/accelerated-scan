@@ -4,8 +4,8 @@
 using namespace kittens; // this kernel only handles headdim=q_reg.cols for simplicity. Also n should be a multiple of 256 here.
 
 
-template <typename H = bf16, int _height, int _width>
-__device__ void tileprint(rt<H, _height, _width, ducks::rt_layout::row> reg, char *name) {
+template <typename H = bf16, int _time, int _key>
+__device__ void tileprint(rt<H, _time, _key, ducks::rt_layout::row> reg, char *name) {
     auto laneid = kittens::laneid();
     static_assert(reg.height == 1 && reg.width == 1, "height and width must be 1");
     for(int i = 0; i < reg.height; i++) {
@@ -44,24 +44,52 @@ __device__ void tileprint(rt<H, _height, _width, ducks::rt_layout::row> reg, cha
 }
 
 
-template<ducks::rt::all T>
-__device__ static inline void sub_singlerow(T &dst, const T &lhs, const T &rhs, const int row_index) {
+template<typename op, ducks::rt::all T>
+__device__ static inline void op_singlerow(T &dst, const T &lhs, const T &rhs, const int row_index) {
     const int row_top = laneid() / 4;
     const int row_bottom = row_top + 8;
 
-    static_assert(dst.packed_per_tile == 4, "packed_per_thread must be 4");
+    static_assert(dst.packed_per_tile == 4, "packed_per_tile must be 4");
+    using dtype = T::dtype;
 
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
         #pragma unroll
         for(int j = 0; j < dst.width; j++) {            
             if (row_top == row_index) {
-                dst.tiles[i][j].data[0] = lhs.tiles[i][j].data[0] - rhs.tiles[i][j].data[0];
-                dst.tiles[i][j].data[2] = lhs.tiles[i][j].data[2] - rhs.tiles[i][j].data[2];
+                dst.tiles[i][j].data[0] = op::template op<dtype>(lhs.tiles[i][j].data[0], rhs.tiles[i][j].data[0]);
+                dst.tiles[i][j].data[2] = op::template op<dtype>(lhs.tiles[i][j].data[2], rhs.tiles[i][j].data[2]);
+            } else if (row_bottom == row_index) {
+                dst.tiles[i][j].data[1] = op::template op<dtype>(lhs.tiles[i][j].data[1], rhs.tiles[i][j].data[1]);
+                dst.tiles[i][j].data[3] = op::template op<dtype>(lhs.tiles[i][j].data[3], rhs.tiles[i][j].data[3]);
             }
-            if (row_bottom == row_index) {
-                dst.tiles[i][j].data[1] = lhs.tiles[i][j].data[1] - rhs.tiles[i][j].data[1];
-                dst.tiles[i][j].data[3] = lhs.tiles[i][j].data[3] - rhs.tiles[i][j].data[3];
+        }
+    }
+}
+
+
+template<ducks::rt::all RT>
+__device__ static inline void reset_trailing_rows(RT &dst, const int row_index, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const int row_top = laneid() / 4;
+    const int row_bottom = row_top + 8;
+
+    static_assert(dst.packed_per_tile == 4, "packed_per_tile must be 4");
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {            
+            if (row_top >= row_index) {
+                dst.tiles[i][j].data[0].x = val;
+                dst.tiles[i][j].data[0].y = val;
+                dst.tiles[i][j].data[2].x = val;
+                dst.tiles[i][j].data[2].y = val;
+            }
+            if (row_bottom >= row_index) {
+                dst.tiles[i][j].data[1].x = val;
+                dst.tiles[i][j].data[1].y = val;
+                dst.tiles[i][j].data[3].x = val;
+                dst.tiles[i][j].data[3].y = val;
             }
         }
     }
@@ -131,8 +159,7 @@ __device__ void vecprint(rv<bf16_2, 1, 1> reg, char *name) {
 }
 
 
-
-template <typename H = c10::BFloat16, int _height, int _width, int kNumWarps = 8, typename T = bf16, typename T2 = bf16_2>
+template <typename H = c10::BFloat16, int _time, int _key, int _value, int kNumWarps = 8, typename T = bf16, typename T2 = bf16_2>
 __global__ void decay_values_backward_kernel(
     int seqlen,
     const H* __restrict__ __d_out_w__,
@@ -147,7 +174,7 @@ __global__ void decay_values_backward_kernel(
     H* __restrict__ __u__
 ) {
     auto warpid           = kittens::warpid();
-    auto block_start      = blockIdx.x*(seqlen*_width*TILE_DIM);
+    auto block_start      = blockIdx.x*(seqlen*_key*TILE_DIM);
     auto beta_block_start = blockIdx.x*(seqlen*TILE_DIM); // width is 1 for beta
     const T *_d_out_w = reinterpret_cast<const T *>(__d_out_w__) + block_start,
             *_d_out_u = reinterpret_cast<const T *>(__d_out_u__) + block_start,
@@ -163,18 +190,24 @@ __global__ void decay_values_backward_kernel(
     shared_allocator al((int*)&__shm[0]);
     
     // K, V and beta live in shared memory -- this is about all that will fit.
-    // st_bf<_height, _width, ducks::st_layout::swizzle> (&k_smem)[kNumWarps] = al.allocate<st_bf<_height, _width, ducks::st_layout::swizzle>, kNumWarps>();
-    // st_bf<_height, _width, ducks::st_layout::swizzle> (&v_smem)[kNumWarps] = al.allocate<st_bf<_height, _width, ducks::st_layout::swizzle>, kNumWarps>();
-    // st_bf<_height, _width, ducks::st_layout::swizzle> (&beta_smem)[kNumWarps] = al.allocate<st_bf<_height, _width, ducks::st_layout::swizzle>, kNumWarps>();
+    // st_bf<_time, _key, ducks::st_layout::swizzle> (&k_smem)[kNumWarps] = al.allocate<st_bf<_time, _key, ducks::st_layout::swizzle>, kNumWarps>();
+    // st_bf<_time, _key, ducks::st_layout::swizzle> (&v_smem)[kNumWarps] = al.allocate<st_bf<_time, _value, ducks::st_layout::swizzle>, kNumWarps>();
+    // st_bf<_time, 1, ducks::st_layout::swizzle> (&beta_smem)[kNumWarps] = al.allocate<st_bf<_time, ducks::st_layout::swizzle>, kNumWarps>();
 
-    // Initialize all of the register tiles.
-    rt<T2, _height, _width> k_reg, v_reg; // v_reg need to be swapped into col_l
-    typename rt<T2, _height, _width>::col_vec beta_reg;
-    rt_fl<_height, _height> mma_TT;
-    rt_fl<_height, _width> mma_TD;
-    rt<T2, _height, _height> K;
-    rt<T2, _height, _width> c_u, c_w;
-    rt<T2, _height, _width> w_reg, u_reg;
+    /*
+     * register allocations
+     */
+    rt<T2, _time, _key> k_reg, d_out_w_reg;
+    rt<T2, _time, _value> v_reg;
+    typename rt<T2, _time, _key>::col_vec beta_reg;
+    typename rt<T2, _time, _key>::row_vec d_beta_reg;
+
+    rt<T2, _time, _key> w_reg, w_bases_reg, bk_reg, d_k_reg, tk_reg;
+    rt<T2, _time, _value> u_reg, u_bases_reg;
+    rt<T2, _time, _time> tt_reg, bKl_reg;
+
+    rt<float2, _time, _time> mma_TT;
+    rt<float2, _time, _key> mma_TD;
 
     const int time_blocks = seqlen / (w_reg.rows*kNumWarps);
     //printf("seqlen: %d time_blocks: %d rows: %d\n", seqlen, time_blocks, w_reg.rows);
@@ -183,12 +216,13 @@ __global__ void decay_values_backward_kernel(
     int time_warp_index = warpid; // TODO
 
     /*
-     * load k, v, beta
+     * load k, v, beta, d_out_w, d_out_u
      */
 
     load(k_reg, _k + time_warp_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
     load(v_reg, _v + time_warp_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
     load(beta_reg, _beta + time_warp_index); // beta = beta.clone()
+    load(d_out_w_reg, _d_out_w + time_warp_index*d_out_w_reg.num_elements, d_out_w_reg.cols); // d_out_w = d_out_w.clone()
 
     /*
      * decay_values_forward: compute w and u
@@ -196,34 +230,43 @@ __global__ void decay_values_backward_kernel(
 
     __syncthreads();
 
+    mul_row(bk_reg, k_reg, beta_reg); // bk = einsum('nt,ntk->ntk', beta, k)
+
+    zero(mma_TT);
+    mma_ABt(mma_TT, k_reg, k_reg, mma_TT); // tt = einsum('ntd,nsd->nts', k, k)
+    copy(tt_reg, mma_TT);
+    make_causal(tt_reg, tt_reg, 0);
+    set_diagonal(tt_reg, tt_reg, 0); // tt = tt.tril(diagonal=-1)
+
+    mul_row(bKl_reg, tt_reg, beta_reg); // bKl = einsum('nt,nts->nts', beta, K)
+
     zero(w_reg);
     zero(u_reg);
-    zero(K);    
-    zero(mma_TT);
-    mma_ABt(mma_TT, k_reg, k_reg, mma_TT); // K = k@k.T dimensions: (T,S)
-    copy(K, mma_TT); // convert to bf16 for mma_ABt
-    mul_row(K, K, beta_reg); // K[t, :] *= beta[t]
-    mul_row(k_reg, k_reg, beta_reg); // k[t, :] *= beta[t]
-    mul_row(v_reg, v_reg, beta_reg); // v[t, :] *= beta[t]
+    copy(u_bases_reg, v_reg); // u_bases = v
+    mul_row(v_reg, v_reg, beta_reg); // v = einsum('nt,ntw->ntw', beta, v)
 
     for (auto t = 0; t < w_reg.rows; t++) {
         __syncthreads();
 
-        zero(mma_TT);
-        rt<T2, _height, _width, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
-        mma_AB(mma_TT, K, w_reg_col, mma_TT);
-        w_reg = swap_layout_inplace(w_reg_col);
-        copy(c_w, mma_TT);
-        sub_singlerow(w_reg, k_reg, c_w, t); // w[t] = k[t] - c_w[t]
+        {
+            zero(mma_TD);
+            rt<T2, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
+            mma_AB(mma_TD, bKl_reg, w_reg_col, mma_TD);
+            w_reg = swap_layout_inplace(w_reg_col);
+            copy(tk_reg, mma_TD);
+            op_singlerow<base_ops::sub>(w_reg, bk_reg, tk_reg, t); // w[t] = bk[t] - tk[t]
+        }
 
         __syncthreads();
     
-        zero(mma_TT);
-        rt<T2, _height, _width, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
-        mma_AB(mma_TT, K, u_reg_col, mma_TT); // (T,S) (S,D) -> (T,D)
-        u_reg = swap_layout_inplace(u_reg_col);
-        copy(c_u, mma_TT);
-        sub_singlerow(u_reg, v_reg, c_u, t); // u[t] = v[t] - c_u[t]
+        {
+            zero(mma_TD);
+            rt<T2, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
+            mma_AB(mma_TD, bKl_reg, u_reg_col, mma_TD); // (T,S) (S,D) -> (T,D)
+            u_reg = swap_layout_inplace(u_reg_col);
+            copy(tk_reg, mma_TD);
+            op_singlerow<base_ops::sub>(u_reg, v_reg, tk_reg, t); // u[t] = bv[t] - tk[t]
+        }
     }
 
     __syncthreads();
@@ -231,60 +274,139 @@ __global__ void decay_values_backward_kernel(
     store(_w, w_reg, w_reg.cols);
     store(_u, u_reg, u_reg.cols);
 
-    /*
-     * decay_values_backward: compute d_{w_t} / d_{b_s}
-     */
-
-    rt<T2, _height, _width> bases_reg;
-    rt<T2, _height, _height> decays_reg;
-    rt<T2, _height, _height> pre_reg;
-
-    zero(k_reg);
-    load(k_reg, _k + time_warp_index*k_reg.num_elements, k_reg.cols); // k = k.clone(), again
-
-    zero(K);
-    zero(mma_TT);
-    mma_ABt(mma_TT, k_reg, k_reg, mma_TT); // K = k@k.T dimensions: (T,S)
-    copy(K, mma_TT); // convert to bf16 for mma_ABt
-    make_causal(K, K, 0);
-    set_diagonal(K, K, 0);
-
-    zero(mma_TD);
-    rt<T2, _height, _width, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
-    mma_AB(mma_TD, K, w_reg_col, mma_TD); // bases_reg = K@w
-    w_reg = swap_layout_inplace(w_reg_col);
-    copy(bases_reg, mma_TD);
-
-    sub(bases_reg, k_reg, bases_reg); // bases = k - K@w
-    mul_row(K, K, beta_reg); // K[t, :] *= beta[t]
-
-    zero(decays_reg);
-    set_diagonal(decays_reg, decays_reg, 1);
-    for (auto t = 0; t < decays_reg.rows; t++) {
-        __syncthreads();
-
-        zero(mma_TT);
-        rt<T2, _height, _width, ducks::rt_layout::col> &decays_reg_col = swap_layout_inplace(decays_reg);
-        mma_AB(mma_TT, K, decays_reg_col, mma_TT); // (T,S) (S,D) -> (T,D)
-        decays_reg = swap_layout_inplace(decays_reg_col);
-        copy(pre_reg, mma_TT);
-        sub_singlerow(decays_reg, decays_reg, pre_reg, t); // decays[t] = (decays - K@decays)[t]
+    {
+        zero(mma_TD);
+        rt<T2, _time, _key, ducks::rt_layout::col> &w_reg_col = swap_layout_inplace(w_reg);
+        mma_AB(mma_TD, tt_reg, w_reg_col, mma_TD); // mma_TD = einsum('nts,nsk->ntk', tt, w)
+        w_reg = swap_layout_inplace(w_reg_col);
+        copy(w_bases_reg, mma_TD);
+        sub(w_bases_reg, k_reg, w_bases_reg); // w_bases_reg = k - mma_TD
     }
 
+    {
+        zero(mma_TD);
+        rt<T2, _time, _key, ducks::rt_layout::col> &u_reg_col = swap_layout_inplace(u_reg);
+        mma_AB(mma_TD, tt_reg, u_reg_col, mma_TD); // mma_TD = einsum('nts,nsw->ntw', tt, u)
+        u_reg = swap_layout_inplace(u_reg_col);
+        copy(v_reg, mma_TD);
+        sub(u_bases_reg, u_bases_reg, v_reg); // u_bases = u_bases_reg - mma_TD
+    }
+
+    /*
+     * backward for d_k, d_v, d_beta
+     */
+
+    rt<T2, _time, _value> &d_out_u_reg = v_reg;
+    zero(d_out_u_reg);
+    load(d_out_u_reg, _d_out_u + time_warp_index*d_out_u_reg.num_elements, d_out_u_reg.cols); // d_out_u = d_out_u.clone()
+    zero(d_k_reg);
+
+    for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
+        __syncthreads();
+
+        rt<T2, _time, _key, ducks::rt_layout::col> &k_reg_col = swap_layout_inplace(k_reg);
+
+        // d_k
+        zero(mma_TD);
+        {
+            zero(mma_TT);
+            mma_ABt(mma_TT, w_reg, d_out_w_reg, mma_TT);
+            copy(tt_reg, mma_TT);
+            reset_trailing_rows(tt_reg, t);
+
+            {
+                rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+                mma_AtB(mma_TD, tt_reg_col, k_reg_col, mma_TD);
+                tt_reg = swap_layout_inplace(tt_reg_col);
+            }
+
+            zero(mma_TT);
+            mma_ABt(mma_TT, u_reg, d_out_u_reg, mma_TT);
+            copy(tt_reg, mma_TT);
+            reset_trailing_rows(tt_reg, t);
+
+            {
+                rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+                mma_AtB(mma_TD, tt_reg_col, k_reg_col, mma_TD);
+                tt_reg = swap_layout_inplace(tt_reg_col);
+            }
+   
+            copy(tk_reg, mma_TD);
+            op_singlerow<base_ops::sum>(d_k_reg, d_k_reg, tk_reg, t);
+
+            printf("laneid=%d t=%d\n", laneid(), t);
+            tileprint(tk_reg, "tk");
+        }
+
+        k_reg = swap_layout_inplace(k_reg_col);
+
+        // backpropagate through time, updating only remaining timestamps
+        {
+            zero(tt_reg);
+            op_singlerow<base_ops::sum>(tt_reg, tt_reg, bKl_reg, t);
+            rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+
+            {
+                zero(mma_TD);
+                rt<T2, _time, _key, ducks::rt_layout::col> &d_out_w_reg_col = swap_layout_inplace(d_out_w_reg);
+                mma_AtB(mma_TD, tt_reg_col, d_out_w_reg_col, mma_TD);
+                d_out_w_reg = swap_layout_inplace(d_out_w_reg_col);
+
+                copy(tk_reg, mma_TD);
+                sub(d_out_w_reg, d_out_w_reg, tk_reg);
+
+                zero(mma_TD);
+                rt<T2, _time, _value, ducks::rt_layout::col> &d_out_u_reg_col = swap_layout_inplace(d_out_u_reg);
+                mma_AtB(mma_TD, tt_reg_col, d_out_u_reg_col, mma_TD);
+                d_out_u_reg = swap_layout_inplace(d_out_u_reg_col);
+
+                copy(tk_reg, mma_TD);
+                sub(d_out_u_reg, d_out_u_reg, tk_reg);
+            }
+
+            tt_reg = swap_layout_inplace(tt_reg_col);
+        }
+
+    }
+
+    tileprint(d_k_reg, "DK");
+
     __syncthreads();
 
+    sub(d_k_reg, d_out_w_reg, d_k_reg); // d_k = d_out_w - d_k
+    mul_row(d_k_reg, d_k_reg, beta_reg); // d_k = einsum('ntk,nt->ntk', d_k, beta)
+
+    // decay w and u
+    zero(mma_TT);
+    mma_ABt(mma_TT, d_out_w_reg, w_reg, mma_TT);
+    mma_ABt(mma_TT, d_out_u_reg, u_reg, mma_TT);
+    copy(tt_reg, mma_TT);
+    make_causal(tt_reg, tt_reg, 0);
+    set_diagonal(tt_reg, tt_reg, 0);
+
+    rt<T2, _time, _time, ducks::rt_layout::col> &tt_reg_col = swap_layout_inplace(tt_reg);
+    rt<T2, _time, _value, ducks::rt_layout::col> &bk_reg_col = swap_layout_inplace(bk_reg);
     zero(mma_TD);
-    load(pre_reg, _d_out_w + time_warp_index*pre_reg.num_elements, pre_reg.cols); // pre_reg = d_out_w.clone()
-    mma_ABt(mma_TD, pre_reg, bases_reg, mma_TD); // mma = d_out_w@bases.T
-    copy(pre_reg, mma_TD); // pre_reg = d_out_w@bases.T
-    mul(pre_reg, pre_reg, decays_reg); // pre_reg *= decays_reg
+    mma_AtB(mma_TD, tt_reg_col, bk_reg_col, mma_TD);
+    copy(tk_reg, mma_TD);
+    sub(d_k_reg, d_k_reg, tk_reg);
 
-    typename rt<T2, _height, _height>::row_vec d_beta_reg;
+    store(_d_k, d_k_reg, d_k_reg.cols);
+
+    // d_beta
+    mul(w_bases_reg, w_bases_reg, d_out_w_reg); // w_bases = einsum('ntk,ntk->ntk', w_bases, d_out_w)
+    mul(u_bases_reg, u_bases_reg, d_out_u_reg); // u_bases = einsum('ntw,ntw->ntw', u_bases, d_out_u)
+
+    // d_v using available d_out_u_reg register
+    mul_row(d_out_u_reg, d_out_u_reg, beta_reg);
+    store(_d_v, d_out_u_reg, d_out_u_reg.cols);
+
+    // continue d_beta reusing the beta register
+    rt<T2, _time, _key, ducks::rt_layout::col> &w_bases_col = swap_layout_inplace(w_bases_reg);
+    rt<T2, _time, _value, ducks::rt_layout::col> &u_bases_col = swap_layout_inplace(u_bases_reg);
     zero(d_beta_reg);
-    col_sum(d_beta_reg, pre_reg); // d_beta = einsum('ts->s', pre_reg) 
-
-    __syncthreads();
-
+    row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
+    row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
     store(_d_beta, d_beta_reg);
 }
 
@@ -347,9 +469,9 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
     auto threads = kNumWarps * kittens::WARP_THREADS;
     //printf("[decay_values_backward] Requesting %lu bytes of memory for %d worker warps (%d threads)\n", mem_size, kNumWarps, threads);
     CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-        decay_values_backward_kernel<H, kHeight, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));
+        decay_values_backward_kernel<H, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));
     
-    decay_values_backward_kernel<H, kHeight, kWidth, kNumWarps, T, T2><<<batch_head,threads,mem_size>>>(
+    decay_values_backward_kernel<H, kHeight, kWidth, kWidth, kNumWarps, T, T2><<<batch_head,threads,mem_size>>>(
         (int)seqlen,
         d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(),
         k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(),
