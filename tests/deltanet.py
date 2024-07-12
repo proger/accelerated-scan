@@ -2,13 +2,12 @@
 DeltaNet implementation reference for Accelerated Scan.  DeltaNet performs efficient management of a large fixed-sized memory.
 
 For a simple single chunk version see `forward_simple`.
-It computes decayed values by a little bit of recurrence (`decay_values`)
-and then applies linear attention (`causal_attend`).
+It computes decayed values by a little bit of recurrence and then applies linear attention (`decay_values`).
 
 `forward_chunkwise` is inspired by Yang 2024. It applies single chunk version pointwise and
 then performs chunk-level stitching.
 
-forward_ogloop and forward_scanloop are reference implementations of straightforward recurrences.
+forward_loop is the reference implementation of the original recurrence.
 
 References:
 [1] The WY Representation for Products of Householder Matrices (Bischof and Van Loan 1985)
@@ -40,9 +39,9 @@ from torch import einsum, randn, allclose, stack, eye, manual_seed, no_grad, set
 set_float32_matmul_precision('high')
 
 
-def decay_values(k, v, beta):
+def decay_values(q, k, v, beta):
     "decay values applying deltanet forgetting rules"
-    NH, T, D = shape(None, k, v, beta)
+    NH, T, D = shape(q, k, v, beta)
 
     beta_ = beta.unsqueeze(-1)
     w = beta_ * k.clone()
@@ -53,21 +52,13 @@ def decay_values(k, v, beta):
         w[:, t] -= beta_[:, t] * einsum('nt,ntd->nd', K[:, :t, t], w[:, :t].clone())
         u[:, t] -= beta_[:, t] * einsum('nt,ntd->nd', K[:, :t, t], u[:, :t].clone())
 
-    return w, u
+    # attend to decayed values
+    qk = einsum("nsi,nti->nst", q, k)
+    mask = q.new_ones(T, T).tril()
+    qk = einsum('nst,st->nst', qk, mask)
+    y = einsum("nst,ntj->nsj", qk, u)
 
-
-def causal_attend(q, k, v, diagonal=0):
-    "apply linear attention with a causal mask"
-    NH, T, D = shape(q, k, v)
-    mask = q.new_ones(T, T).tril(diagonal=diagonal)
-    y = einsum("nsi,nti,st,ntj->nsj", q, k, mask, v)
-    return y
-
-
-def forward_simple(q, k, v, beta):
-    "simple deltanet: linear attention to decayed values"
-    w, u = decay_values(k, v, beta)
-    return causal_attend(q, k, u)
+    return w, u, y
 
 
 def forward_chunkwise(q, k, v, beta, chunk_size=2):
@@ -79,8 +70,7 @@ def forward_chunkwise(q, k, v, beta, chunk_size=2):
     )
 
     # evaluate all chunks in parallel
-    w, u = decay_values(k_, v_, beta_)
-    y = causal_attend(q_, k_, u)
+    w, u, y = decay_values(q_, k_, v_, beta_)
 
     # stitch chunks sequentially
     y_delta, _ = stitch_forward(q, k, w, u, C=C, chunk_size=chunk_size)
@@ -110,17 +100,23 @@ def stitch_forward(q, k, w, u, C, chunk_size):
 
 
 def stitch1_forward(state, q, k, w, u):
-    state_decays = einsum('nvk,ntk->ntv', state, w)
-    state_add = einsum('ntv,ntk->nvk', u - state_decays, k)
+    NH, T, D = shape(q, k, u, None)
+    
+    u_old = einsum('nvk,ntk->ntv', state, w)
+    y = einsum('nvk,nsk->nsv', state, q)
+    state_delta = einsum('ntv,ntk->nvk', u - u_old, k)
+    
+    # attend to old values
+    qk = einsum("nsi,nti->nst", q, k)
+    mask = q.new_ones(T, T).tril(diagonal=0)
+    qk = einsum('nst,st->nst', qk, mask)
+    y_prev = einsum("nst,ntj->nsj", qk, u_old)
 
-    delta = causal_attend(q, k, state_decays)
-    prev_output = einsum('nvk,nsk->nsv', state, q)
-    y = prev_output - delta
-
-    return y, state + state_add
+    state = state + state_delta
+    return y - y_prev, state
 
 
-def forward_ogloop(q, k, v, beta):
+def forward_loop(q, k, v, beta):
     "reference: w_t = w_{t-1} + beta_t (v_t - w_t k_t) k_t"
     NH, T, D = shape(q, k, v, beta)
 
@@ -136,30 +132,6 @@ def forward_ogloop(q, k, v, beta):
         v_old = einsum("nij,nj->ni", w, k_)
         delta = beta_ * (v_ - v_old)
         w = w + einsum("ni,nj->nij", delta, k_)
-
-        y.append(einsum("nij,nj->ni", w, q_))
-
-    return stack(y, dim=1)
-
-
-def forward_scanloop(q, k, v, beta):
-    "reference via linear-time scan: w_t = w_{t-1} (I - beta_t k_t k_t.T) + beta v_t k_t.T"
-    NH, T, D = shape(q, k, v, beta)
-
-    w = k.new_zeros(NH, D, D)
-    id = eye(D, device=w.device).expand(NH, D, D)
-    y = []
-
-    for t in range(T):
-        q_ = q[:, t]
-        k_ = k[:, t]
-        v_ = v[:, t]
-        beta_ = beta[:, t].unsqueeze(-1).unsqueeze(-1)
-        beta_sqrt_ = beta_.squeeze(-1).sqrt()
-
-        forget = id - einsum("ni,nj->nij", beta_sqrt_ * k_, beta_sqrt_ * k_)
-        update = beta_ * einsum("ni,nj->nij", v_, k_)
-        w = einsum("nik,nkj->nij", w, forget) + update
 
         y.append(einsum("nij,nj->ni", w, q_))
 
@@ -192,14 +164,13 @@ def make_example(NH, T, D):
 
 def test_equal(atol=1e-6):
     NH, T, D = 2*3, 128, 16
-    #NH, T, D = 1, 8, 3
+    #NH, T, D = 1, 8, 32
+    torch.set_printoptions(precision=3, sci_mode=False)
     q, k, v, beta = make_example(NH, T, D)
 
-    y1 = forward_ogloop(q, k, v, beta)
-    y2 = forward_scanloop(q, k, v, beta)
-    y3 = forward_simple(q, k, v, beta)
+    y1 = forward_loop(q, k, v, beta)
+    _, _, y3 = decay_values(q, k, v, beta)
 
-    assert allclose(y1, y2, atol=atol), (y1 - y2).abs().max()
     assert allclose(y1, y3, atol=atol), (y1 - y3).abs().max()
 
     for chunk_size in (1,2,4,8):
@@ -209,94 +180,19 @@ def test_equal(atol=1e-6):
 
 test_equal()
 
-#%%
-
-
-@no_grad()
-def attend_backward(d_out, q, k, v, g):
-    d_q = einsum('nsv,ntk,ntv,nst->nsk', d_out, k, v, g)
-    d_k = einsum('nsv,nsk,ntv,nst->ntk', d_out, q, v, g)
-    d_v = einsum('nsv,nsk,ntk,nst->ntv', d_out, q, k, g)
-    d_g = einsum('nsv,nsk,ntk,ntv,nst->nst', d_out, q, k, v, g)
-    return d_q, d_k, d_v, d_g
-
-
-@no_grad()
-def causal_attend_backward(d_out, q, k, v, diagonal=0):
-    NH, T, D = shape(q, k, v)
-    mask = q.new_ones(T, T).tril(diagonal=diagonal).unsqueeze(0)
-    d_q, q_k, d_v, _d_mask = attend_backward(d_out, q, k, v, mask)
-    return d_q, q_k, d_v
-
-
-class CausalAttend(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v):
-        ctx.save_for_backward(q, k, v)
-        return causal_attend(q, k, v)
-
-    @staticmethod
-    def backward(ctx, d_out):
-        q, k, v = ctx.saved_tensors
-        return causal_attend_backward(d_out, q, k, v)
-
-
-def test_equal_attend_backward(atol=1e-5):
-    NH, T, D = 1*1, 512, 64
-    q, k, v, beta = make_example(NH, T, D)
-
-    y = causal_attend(q, k, v)
-    d_q, d_k, d_v = causal_attend_backward(torch.ones_like(y), q, k, v)
-    y.sum().backward()
-
-    assert allclose(q.grad, d_q, atol=atol), 'q.grad is wrong'
-    assert allclose(k.grad, d_k, atol=atol), 'k.grad is wrong'
-    assert allclose(v.grad, d_v, atol=atol), 'v.grad is wrong'
-
-    ## TODO: test gates (g)
-    # print((g_hook.grad - d_g).pow(2).mean(), 'error')
-    # print((g_hook.grad - d_g).abs().max(), 'max abs error')
-    # assert torch.allclose(g_hook.grad, d_g, atol=1e-1), 'g.grad is wrong'
-
-
-def test_equal_attend_backward2(atol=1e-5):
-    NH, T, D = 1, 2, 2
-    q1, k1, v1, beta1 = make_example(NH, T, D)
-    y1 = causal_attend(q1, k1, v1)
-    (y1 - torch.ones_like(y1)).pow(2).mean().backward()
-
-    q, k, v, beta = make_example(NH, T, D)
-    y = CausalAttend.apply(q, k, v)
-    (y - torch.ones_like(y)).pow(2).mean().backward()
-
-    # print(q1.grad - q.grad, 'q.grad diff')
-    # print(k1.grad - k.grad, 'k.grad diff')
-    # print(v1.grad - v.grad, 'v.grad diff')
-    # print(k.grad, 'k.grad')
-    # print(k1.grad, 'k1.grad')
-    # print(v.grad, 'v.grad')
-    # print(v1.grad, 'v1.grad')
-
-    assert (q1.grad - q.grad).abs().max() < atol, 'q.grad is wrong'
-    assert (k1.grad - k.grad).abs().max() < atol, 'k.grad is wrong'
-    assert (v1.grad - v.grad).abs().max() < atol, 'v.grad is wrong'
-
-
-test_equal_attend_backward()
-test_equal_attend_backward2()
-
 
 #%%
 
 @no_grad()
-def decay_values_backward(d_out_w, d_out_u, k, v, beta):
-    NH, T, D = shape(None, k, v, beta)
+def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
+    NH, T, D = shape(q, k, v, beta)
 
     #
     # allocations
     #
 
     # this group is loaded from global memory
+    q = q.clone() # load q
     k = k.clone() # load k
     v = v.clone() # load v
     beta = beta.clone() # load beta
@@ -341,11 +237,28 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
     u_bases = u_bases - v
 
     #
+    # causal_attend_backward for d_q, d_k_2, d_out_u
+    #
+
+    tt = einsum('nsv,ntv->nst', d_out_y, u)
+    tt = tt.tril()
+    d_q = einsum('nst,ntk->nsk', tt, k)
+    d_q.clone() # store
+
+    d_k_2 = einsum('nst,nsk->ntk', tt, q)
+    d_k_2.clone() # store to shared memory?
+
+    tt = einsum('nsk,ntk->nst', q, k)
+    tt = tt.tril()
+
+    v.zero_() # reuse register space of v for d_out_u
+    d_out_u = d_out_u.clone() # load ntw
+    d_out_u += einsum('nsv,nst->ntv', d_out_y, tt)
+
+    #
     # backward for d_k, d_v, d_beta
     #
 
-    v.zero_() # reuse register space of v for d_out_u
-    d_out_u = d_out_u.clone() # ntw
     d_k.zero_()
 
     for t in range(T-1,-1,-1):
@@ -378,6 +291,8 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
 
     tk = einsum('ntj,ntk->njk', tt, bk)
     d_k = d_k - tk
+    d_k_2 = d_k_2.clone() # load from shared memory
+    d_k = d_k_2 + d_k
     d_k = d_k.clone() # store
 
     # d_beta
@@ -393,34 +308,34 @@ def decay_values_backward(d_out_w, d_out_u, k, v, beta):
     beta += einsum('ntv->nt', u_bases)
     d_beta = beta.clone() # store
 
-    return d_k, d_v, d_beta
+    return d_q, d_k, d_v, d_beta
 
 
 class DecayValues(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, k, v, beta):
-        w, u = decay_values(k, v, beta)
-        ctx.save_for_backward(k, v, beta)
-        return w, u
+    def forward(ctx, q, k, v, beta):
+        w, u, y = decay_values(q, k, v, beta)
+        ctx.save_for_backward(q, k, v, beta)
+        return w, u, y
 
     @staticmethod
-    def backward(ctx, d_out_w, d_out_u):
-        k, v, beta = ctx.saved_tensors
-        return decay_values_backward(d_out_w, d_out_u, k, v, beta)
+    def backward(ctx, d_out_w, d_out_u, d_out_y):
+        q, k, v, beta = ctx.saved_tensors
+        return decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta)
 
 
 def test_equal_decay_values_backward():
     NH, T, D = 1, 16, 16
 
     q, k, v, beta = make_example(NH, T, D)
-    w, u = decay_values(k, v, beta)
-    (w + u - torch.ones_like(w)).pow(2).mean().backward()
-    #(w - torch.ones_like(w)).pow(2).mean().backward()
+    w, u, y = decay_values(q, k, v, beta)
+    (y - torch.ones_like(y)).pow(2).mean().backward()
 
     q1, k1, v1, beta1 = make_example(NH, T, D)
-    w1, u1 = DecayValues.apply(k1, v1, beta1)
-    (w1 + u1 - torch.ones_like(w1)).pow(2).mean().backward()
-    #(w1 - torch.ones_like(w1)).pow(2).mean().backward()
+    w1, u1, y1 = DecayValues.apply(q1, k1, v1, beta1)
+    (y1 - torch.ones_like(y1)).pow(2).mean().backward()
+
+    assert allclose(q.grad, q1.grad, atol=1e-5), 'q_grad is wrong'
 
     # print(v.grad, 'v.grad', v.grad.shape)
     # print(v1.grad, 'v1.grad')
@@ -442,12 +357,23 @@ test_equal_decay_values_backward()
 
 
 def stitch1_backward(d_y, d_state, state, q, k, w, u):
+    NH, T, D = shape(q, k, u, None)
+
     state_decays = einsum('nvk,ntk->ntv', state, w)
 
     d_q1 = einsum('nsv,nvk->nsk', d_y, state) # prev_output
     d_state1 = einsum('nsv,nsk->nvk', d_y, q) # prev_output
 
-    d_q2, d_k1, d_state_decays1 = causal_attend_backward(-d_y, q, k, state_decays) # delta
+    # causal_attend_backward for delta
+    mask = q.new_ones(T, T).tril()
+    d_out_att = -d_y
+    d_out_state_decays = einsum('nsv,ntv->nst', d_out_att, state_decays)
+    d_out_state_decays = einsum('nst,st->nst', d_out_state_decays, mask)
+    d_q2 = einsum('nst,ntk->nsk', d_out_state_decays, k)
+    d_k1 = einsum('nst,nsk->ntk', d_out_state_decays, q)
+    qk = einsum('nsk,ntk->nst', q, k)
+    qk = einsum('nst,st->nst', qk, mask)
+    d_state_decays1 = einsum('nsv,nst->ntv', d_out_att, qk)
 
     d_k2 = einsum('nvk,ntv->ntk', d_state, u - state_decays) # state_add
     d_u = einsum('nvk,ntk->ntv', d_state, k) # state_add
@@ -528,7 +454,7 @@ def test_stitch_all(atol=1e-5):
     NH, T, D = 1, 4, 2
     C, chunk_size = 2, 2
     q, k, v, beta = make_example(NH, T, D)
-    w, u = decay_values(k, v, beta)
+    w, u, y = decay_values(q, k, v, beta)
 
     q.requires_grad_()
     k.requires_grad_()
@@ -549,7 +475,7 @@ def test_stitch_all(atol=1e-5):
     # print(u.grad, 'u.grad')
 
     q1, k1, v1, beta1 = make_example(NH, T, D)
-    w1, u1 = decay_values(k1, v1, beta1)
+    w1, u1, y1 = decay_values(q1, k1, v1, beta1)
 
     q1.requires_grad_()
     k1.requires_grad_()
@@ -600,18 +526,16 @@ class DeltaChunkwise(torch.autograd.Function):
             v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
         )
 
-        w, u = decay_values(k_, v_, beta_)
+        w, u, y = decay_values(q_, k_, v_, beta_)
 
-        d_q_1, d_k_1, d_w, d_u1 = stitch_backward(d_y, q, k, w, u, C=C, chunk_size=chunk_size)
+        d_q_1, d_k_1, d_w, d_u = stitch_backward(d_y, q, k, w, u, C=C, chunk_size=chunk_size)
 
         d_w = d_w.view(NH*C, chunk_size, D)
-        d_u1 = d_u1.view(NH*C, chunk_size, D)
+        d_u = d_u.view(NH*C, chunk_size, D)
         d_y = d_y.view(NH*C, chunk_size, D)
         u = u.view(NH*C, chunk_size, D)
 
-        d_q_2, d_k_2, d_u2 = causal_attend_backward(d_y, q_, k_, u)
-        d_u = d_u1 + d_u2
-        d_k_3, d_v_, d_beta_ = decay_values_backward(d_w, d_u, k_, v_, beta_)
+        d_q_2, d_k_2, d_v_, d_beta_ = decay_values_backward(d_w, d_u, d_y, q_, k_, v_, beta_)
 
         d_q_1 = d_q_1.view(NH, T, D)
         d_q_2 = d_q_2.view(NH, C, chunk_size, D)
@@ -619,8 +543,7 @@ class DeltaChunkwise(torch.autograd.Function):
         d_q = d_q_1 + d_q_2
 
         d_k_2 = d_k_2.reshape(NH, T, D)
-        d_k_3 = d_k_3.reshape(NH, T, D)
-        d_k = d_k_1 + d_k_2 + d_k_3
+        d_k = d_k_1 + d_k_2
         d_v = d_v_.reshape(NH, T, D)
         d_beta = d_beta_.view(NH, T)
 
