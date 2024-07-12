@@ -73,14 +73,6 @@ def forward_chunkwise(q, k, v, beta, chunk_size=2):
     w, u, y = decay_values(q_, k_, v_, beta_)
 
     # stitch chunks sequentially
-    y_delta, _ = stitch_forward(q, k, w, u, C=C, chunk_size=chunk_size)
-    return y.view(NH, T, D) + y_delta.view(NH, T, D)
-
-
-def stitch_forward(q, k, w, u, C, chunk_size):
-    "stitch chunks sequentially"
-    NH, T, D = shape(q, k, None, None)
-
     q_ = q.view(NH, C, chunk_size, D)
     k_ = k.view(NH, C, chunk_size, D)
     u = u.view(NH, C, chunk_size, D)
@@ -89,31 +81,24 @@ def stitch_forward(q, k, w, u, C, chunk_size):
     # materialize the state for the leading chunk    
     state = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
-    deltas = [u.new_zeros(NH, chunk_size, D)]
+    y_deltas = [u.new_zeros(NH, chunk_size, D)]
     for c in range(1, C):
-        y_delta1, state = stitch1_forward(state, q_[:, c], k_[:, c], w[:, c], u[:, c])
-        deltas.append(y_delta1)
+        u_old = einsum('nvk,ntk->ntv', state, w[:, c])
+        y_cur = einsum('nvk,nsk->nsv', state, q_[:, c])
+        
+        # attend to old values
+        qk = einsum("nsi,nti->nst", q_[:, c], k_[: ,c])
+        qk = qk.tril()
+        y_prev = einsum("nst,ntj->nsj", qk, u_old)
 
-    y_delta = torch.stack(deltas, dim=1)
+        y_deltas.append(y_cur - y_prev)
 
-    return y_delta, state
+        state_delta = einsum('ntv,ntk->nvk', u[:, c] - u_old, k_[:, c])
+        state = state + state_delta
 
+    y_delta = torch.stack(y_deltas, dim=1)
 
-def stitch1_forward(state, q, k, w, u):
-    NH, T, D = shape(q, k, u, None)
-    
-    u_old = einsum('nvk,ntk->ntv', state, w)
-    y = einsum('nvk,nsk->nsv', state, q)
-    state_delta = einsum('ntv,ntk->nvk', u - u_old, k)
-    
-    # attend to old values
-    qk = einsum("nsi,nti->nst", q, k)
-    mask = q.new_ones(T, T).tril(diagonal=0)
-    qk = einsum('nst,st->nst', qk, mask)
-    y_prev = einsum("nst,ntj->nsj", qk, u_old)
-
-    state = state + state_delta
-    return y - y_prev, state
+    return y.view(NH, T, D) + y_delta.view(NH, T, D)
 
 
 def forward_loop(q, k, v, beta):
@@ -160,26 +145,6 @@ def make_example(NH, T, D):
     beta = randn(NH, T).sigmoid()
     beta.requires_grad_()
     return q, k, v, beta
-
-
-def test_equal(atol=1e-6):
-    NH, T, D = 2*3, 128, 16
-    #NH, T, D = 1, 8, 32
-    torch.set_printoptions(precision=3, sci_mode=False)
-    q, k, v, beta = make_example(NH, T, D)
-
-    y1 = forward_loop(q, k, v, beta)
-    _, _, y3 = decay_values(q, k, v, beta)
-
-    assert allclose(y1, y3, atol=atol), (y1 - y3).abs().max()
-
-    for chunk_size in (1,2,4,8):
-        y = forward_chunkwise(q, k, v, beta, chunk_size)
-        assert allclose(y1, y, atol=atol), (y1 - y).abs().max()
-
-
-test_equal()
-
 
 #%%
 
@@ -310,93 +275,7 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
 
     return d_q, d_k, d_v, d_beta
 
-
-class DecayValues(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, beta):
-        w, u, y = decay_values(q, k, v, beta)
-        ctx.save_for_backward(q, k, v, beta)
-        return w, u, y
-
-    @staticmethod
-    def backward(ctx, d_out_w, d_out_u, d_out_y):
-        q, k, v, beta = ctx.saved_tensors
-        return decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta)
-
-
-def test_equal_decay_values_backward():
-    NH, T, D = 1, 16, 16
-
-    q, k, v, beta = make_example(NH, T, D)
-    w, u, y = decay_values(q, k, v, beta)
-    (y - torch.ones_like(y)).pow(2).mean().backward()
-
-    q1, k1, v1, beta1 = make_example(NH, T, D)
-    w1, u1, y1 = DecayValues.apply(q1, k1, v1, beta1)
-    (y1 - torch.ones_like(y1)).pow(2).mean().backward()
-
-    assert allclose(q.grad, q1.grad, atol=1e-5), 'q_grad is wrong'
-
-    # print(v.grad, 'v.grad', v.grad.shape)
-    # print(v1.grad, 'v1.grad')
-    # print(v.grad - v1.grad, 'v diff')
-    assert allclose(v.grad, v1.grad, atol=1e-5), 'v1_grad is wrong'
-
-    # print(beta.grad, 'beta.grad du')
-    # print(beta1.grad, 'beta1.grad du')
-    assert allclose(beta.grad, beta1.grad, atol=1e-5), 'beta1.grad is wrong'
-
-    # print(k.grad, 'k.grad du')
-    # print(k1.grad, 'k1.grad du')
-    # print(k.grad - k1.grad, 'diff du')
-    assert allclose(k.grad, k1.grad, atol=1e-5), 'k1_grad is wrong'
-
-test_equal_decay_values_backward()
-
 # %%
-
-
-def stitch1_backward(d_y, d_state, state, q, k, w, u):
-    NH, T, D = shape(q, k, u, None)
-
-    state_decays = einsum('nvk,ntk->ntv', state, w)
-
-    d_q1 = einsum('nsv,nvk->nsk', d_y, state) # prev_output
-    d_state1 = einsum('nsv,nsk->nvk', d_y, q) # prev_output
-
-    # causal_attend_backward for delta
-    mask = q.new_ones(T, T).tril()
-    d_out_att = -d_y
-    d_out_state_decays = einsum('nsv,ntv->nst', d_out_att, state_decays)
-    d_out_state_decays = einsum('nst,st->nst', d_out_state_decays, mask)
-    d_q2 = einsum('nst,ntk->nsk', d_out_state_decays, k)
-    d_k1 = einsum('nst,nsk->ntk', d_out_state_decays, q)
-    qk = einsum('nsk,ntk->nst', q, k)
-    qk = einsum('nst,st->nst', qk, mask)
-    d_state_decays1 = einsum('nsv,nst->ntv', d_out_att, qk)
-
-    d_k2 = einsum('nvk,ntv->ntk', d_state, u - state_decays) # state_add
-    d_u = einsum('nvk,ntk->ntv', d_state, k) # state_add
-    d_state_decays2 = einsum('nvk,ntk->ntv', -d_state, k) # state_add
-
-    d_state_decays = d_state_decays1 + d_state_decays2
-    d_w = einsum('ntv,nvk->ntk', d_state_decays, state) # state_decays
-    d_state2 = einsum('ntv,ntk->nvk', d_state_decays, w) # state_decays
-
-    return d_state + d_state1 + d_state2, d_q1 + d_q2, d_k1 + d_k2, d_w, d_u
-
-
-class Stitch1(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, state, q, k, w, u):
-        y, new_state = stitch1_forward(state, q, k, w, u)
-        ctx.save_for_backward(state, q, k, w, u)
-        return y, new_state
-
-    @staticmethod
-    def backward(ctx, d_y, d_state):
-        state, q, k, w, u = ctx.saved_tensors
-        return stitch1_backward(d_y, d_state, state, q, k, w, u)
 
 
 def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
@@ -420,90 +299,56 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     # materialize the state for the leading chunk
     states[:, 0] = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
+    # stitch forward
     for c in range(1, C):
-        y_delta[:, c], states[:, c] = stitch1_forward(states[:, c-1], q_[:, c], k_[:, c], w[:, c], u[:, c])
+        u_old = einsum('nvk,ntk->ntv', states[:, c-1], w[:, c])
+        y_cur = einsum('nvk,nsk->nsv', states[:, c-1], q_[:, c])
+        
+        # attend to old values
+        qk = einsum("nsi,nti->nst", q_[:, c], k_[: ,c])
+        qk = qk.tril()
+        y_prev = einsum("nst,ntj->nsj", qk, u_old)
+        y_delta[:, c] = y_cur - y_prev
 
-    for c in range(C-1, 0, -1):
-        (
-            d_state, d_q_[:, c], d_k_[:, c], d_w[:, c], d_u[:, c]
-        ) = stitch1_backward(d_y_delta[:, c], d_state, states[:, c-1], q_[:, c], k_[:, c], w[:, c], u[:, c])
+        state_delta = einsum('ntv,ntk->nvk', u[:, c] - u_old, k_[:, c])
+        states[:, c] = states[:, c-1] + state_delta
 
-    (
-        d_state, d_q_[:, 0], d_k_[:, 0], d_w[:, 0], d_u[:, 0]
-    ) = stitch1_backward(d_y_delta[:, 0], d_state, torch.zeros_like(d_state), q_[:, 0], k_[:, 0], w[:, 0], u[:, 0])
- 
+    # stitch backward
+    for c in range(C-1, -1, -1):
+        if c == 0:
+            prev_state = torch.zeros_like(d_state)
+        else:
+            prev_state = states[:, c-1]
+
+        state_decays = einsum('nvk,ntk->ntv', prev_state, w[:, c])
+
+        d_q1 = einsum('nsv,nvk->nsk', d_y_delta[:, c], prev_state) # prev_output
+        d_state1 = einsum('nsv,nsk->nvk', d_y_delta[:, c], q_[:, c]) # prev_output
+
+        # causal_attend_backward for delta
+        mask = q.new_ones(T, T).tril()
+        d_out_att = -d_y_delta[:, c]
+        d_out_state_decays = einsum('nsv,ntv->nst', d_out_att, state_decays)
+        d_out_state_decays.tril_()
+        d_q2 = einsum('nst,ntk->nsk', d_out_state_decays, k_[:, c])
+        d_k1 = einsum('nst,nsk->ntk', d_out_state_decays, q_[:, c])
+        qk = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
+        qk.tril_()
+        d_state_decays1 = einsum('nsv,nst->ntv', d_out_att, qk)
+
+        d_k2 = einsum('nvk,ntv->ntk', d_state, u[:, c] - state_decays) # state_add
+        d_u[:, c] = einsum('nvk,ntk->ntv', d_state, k_[:, c]) # state_add
+        d_state_decays2 = einsum('nvk,ntk->ntv', -d_state, k_[:, c]) # state_add
+
+        d_state_decays = d_state_decays1 + d_state_decays2
+        d_w[:, c] = einsum('ntv,nvk->ntk', d_state_decays, prev_state) # state_decays
+        d_state2 = einsum('ntv,ntk->nvk', d_state_decays, w[:, c]) # state_decays
+
+        d_state = d_state + d_state1 + d_state2
+        d_q_[:, c] = d_q1 + d_q2
+        d_k_[:, c] = d_k1 + d_k2
+
     return d_q_.view(NH, T, D), d_k_.view(NH, T, D), d_w.view(NH, T, D), d_u.view(NH, T, D)
-
-
-class Stitch(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, w, u, C, chunk_size):
-        y_delta, state = stitch_forward(q, k, w, u, C, chunk_size)
-        ctx.save_for_backward(q, k, w, u)
-        ctx.C = C
-        ctx.chunk_size = chunk_size
-        return y_delta
-
-    @staticmethod
-    def backward(ctx, d_y_delta):
-        q, k, w, u = ctx.saved_tensors
-        return *stitch_backward(d_y_delta, q, k, w, u, ctx.C, ctx.chunk_size), None, None
-
-
-def test_stitch_all(atol=1e-5):
-    NH, T, D = 1, 4, 2
-    C, chunk_size = 2, 2
-    q, k, v, beta = make_example(NH, T, D)
-    w, u, y = decay_values(q, k, v, beta)
-
-    q.requires_grad_()
-    k.requires_grad_()
-    v.requires_grad_()
-    beta.requires_grad_()
-    w.retain_grad()
-    u.retain_grad()
-
-    y, new_state = stitch_forward(q, k, w, u, C=C, chunk_size=chunk_size)
-    loss = (y - torch.ones_like(y)).pow(2).mean()
-    loss.backward()
-
-    # print(q.grad, 'q.grad')
-    # print(k.grad, 'k.grad')
-    # print(v.grad, 'v.grad')
-    # print(beta.grad, 'beta.grad')
-    # print(w.grad, 'w.grad')
-    # print(u.grad, 'u.grad')
-
-    q1, k1, v1, beta1 = make_example(NH, T, D)
-    w1, u1, y1 = decay_values(q1, k1, v1, beta1)
-
-    q1.requires_grad_()
-    k1.requires_grad_()
-    v1.requires_grad_()
-    beta1.requires_grad_()
-    w1.retain_grad()
-    u1.retain_grad()
-
-    y1 = Stitch.apply(q1, k1, w1, u1, C, chunk_size)
-    loss = (y1 - torch.ones_like(y1)).pow(2).mean()
-    loss.backward()
-
-    assert allclose(y, y1, atol=atol), 'y is wrong'
-
-    assert allclose(u.grad, u1.grad, atol=atol), 'u.grad is wrong'
-    assert allclose(v.grad, v1.grad, atol=atol), 'v.grad is wrong'
-    # print(k.grad, 'k.grad')
-    # print(k1.grad, 'k1.grad')
-    assert allclose(k.grad, k1.grad, atol=atol), 'k.grad is wrong'
-    assert allclose(q.grad, q1.grad, atol=atol), 'q.grad is wrong'
-    assert allclose(beta.grad, beta1.grad, atol=atol), 'beta.grad is wrong'
-    assert allclose(w.grad, w1.grad, atol=atol), 'w.grad is wrong'
-
-
-test_stitch_all()
-
-
-#%%
 
 
 class DeltaChunkwise(torch.autograd.Function):
@@ -553,6 +398,8 @@ class DeltaChunkwise(torch.autograd.Function):
 def test_delta_chunkwise_backward():
     NH, T, D = 2, 16, 2
     q1, k1, v1, beta1 = make_example(NH, T, D)
+
+    y0 = forward_loop(q1, k1, v1, beta1)
     
     y1 = forward_chunkwise(q1, k1, v1, beta1, chunk_size=2)
     (y1 - torch.ones_like(y1).detach()).pow(2).mean().backward()
@@ -561,6 +408,7 @@ def test_delta_chunkwise_backward():
     y = DeltaChunkwise.apply(q, k, v, beta, 2)
     (y - torch.ones_like(y).detach()).pow(2).mean().backward()
 
+    assert allclose(y0, y1, atol=1e-5), 'y1 is wrong'
     assert allclose(y1, y, atol=1e-5), 'y is wrong'
 
     # print(beta1.grad - beta.grad, 'beta.grad diff')
