@@ -36,7 +36,31 @@ os.environ['TORCH_LOGS'] = 'output_code'
 import torch
 from torch import einsum, randn, allclose, stack, eye, manual_seed, no_grad, set_float32_matmul_precision, compile, arange
 
-set_float32_matmul_precision('high')
+#set_float32_matmul_precision('high')
+
+
+def tileprint(K, name='K'):
+    "format matches tileprint in tk code so you can diff it"
+    assert K.shape == (16, 16)
+    for laneid in range(32):
+        row_top = laneid // 4
+        row_bottom = row_top + 8
+        col_left = laneid % 4 * 2
+        col_right = col_left + 8
+
+        def fmt(r,c,tag):
+            odd = "y" in tag
+            if odd: # do not print r for odd rows because cuda printf silently runs out of function arguments
+                return f"{name}[,{c:02}] {tag}={K[r,c]: .3f}"
+            else:
+                return f"{name}[{r:02},{c:02}] {tag}={K[r,c]: .3f}"
+
+        print(f"lane={laneid:02}", "    ".join([
+            " ".join([fmt(row_top, col_left, "0x"), fmt(row_top, col_left+1, "0y")]),
+            " ".join([fmt(row_bottom, col_left, "1x"), fmt(row_bottom, col_left+1, "1y")]),
+            " ".join([fmt(row_top, col_right, "2x"), fmt(row_top, col_right+1, "2y")]),
+            " ".join([fmt(row_bottom, col_right, "3x"), fmt(row_bottom, col_right+1, "3y")])
+        ]))
 
 
 def decay_values(q, k, v, beta):
@@ -53,9 +77,8 @@ def decay_values(q, k, v, beta):
         u[:, t] -= beta_[:, t] * einsum('nt,ntd->nd', K[:, :t, t], u[:, :t].clone())
 
     # attend to decayed values
-    qk = einsum("nsi,nti->nst", q, k)
-    mask = q.new_ones(T, T).tril()
-    qk = einsum('nst,st->nst', qk, mask)
+    qk = einsum("nsk,ntk->nst", q, k)
+    qk.tril_()
     y = einsum("nst,ntj->nsj", qk, u)
 
     return w, u, y
@@ -98,7 +121,11 @@ def forward_chunkwise(q, k, v, beta, chunk_size=2):
 
     y_delta = torch.stack(y_deltas, dim=1)
 
-    return y.view(NH, T, D) + y_delta.view(NH, T, D)
+    w = w.view(NH, T, D)
+    u = u.view(NH, T, D)
+    y = y.view(NH, T, D) + y_delta.view(NH, T, D)
+
+    return w, u, y
 
 
 def forward_loop(q, k, v, beta):
@@ -134,15 +161,15 @@ def shape(q, k, v, beta=None):
     return NH, T, D
 
 
-def make_example(NH, T, D):
+def make_example(NH, T, D, device='cpu', dtype=torch.float32):
     manual_seed(0)
-    q = randn(NH, T, D) / D**0.5
+    q = randn(NH, T, D, device=device, dtype=dtype) / D**0.5
     q.requires_grad_()
-    k = randn(NH, T, D) / D**0.5
+    k = randn(NH, T, D, device=device, dtype=dtype) / D**0.5
     k.requires_grad_()
-    v = randn(NH, T, D) / D**0.5
+    v = randn(NH, T, D, device=device, dtype=dtype) / D**0.5
     v.requires_grad_()
-    beta = randn(NH, T).sigmoid()
+    beta = randn(NH, T, device=device, dtype=dtype).sigmoid()
     beta.requires_grad_()
     return q, k, v, beta
 
@@ -162,6 +189,7 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
     v = v.clone() # load v
     beta = beta.clone() # load beta
     d_out_w = d_out_w.clone() # ntk
+    d_out_y = d_out_y.clone() # ntv
 
     w = k.new_zeros(NH, T, D) # ntk
     u = v.new_zeros(NH, T, D) # ntw
@@ -218,7 +246,7 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
 
     v.zero_() # reuse register space of v for d_out_u
     d_out_u = d_out_u.clone() # load ntw
-    d_out_u += einsum('nsv,nst->ntv', d_out_y, tt)
+    d_out_u += einsum('nst,nsv->ntv', tt, d_out_y)
 
     #
     # backward for d_k, d_v, d_beta
@@ -354,14 +382,14 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
 class DeltaChunkwise(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, beta, chunk_size):
-        y = forward_chunkwise(q, k, v, beta, chunk_size)
-        ctx.save_for_backward(q, k, v, beta)
+        w, u, y = forward_chunkwise(q, k, v, beta, chunk_size)
+        ctx.save_for_backward(q, k, v, beta, w, u)
         ctx.chunk_size = chunk_size
         return y
 
     @staticmethod
     def backward(ctx, d_y):
-        q, k, v, beta = ctx.saved_tensors
+        q, k, v, beta, w, u = ctx.saved_tensors
         NH, T, D = shape(q, k, v, beta)
         chunk_size = ctx.chunk_size
         C = T // chunk_size
@@ -370,8 +398,6 @@ class DeltaChunkwise(torch.autograd.Function):
             q.view(NH*C, chunk_size, D), k.view(NH*C, chunk_size, D),
             v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
         )
-
-        w, u, y = decay_values(q_, k_, v_, beta_)
 
         d_q_1, d_k_1, d_w, d_u = stitch_backward(d_y, q, k, w, u, C=C, chunk_size=chunk_size)
 
@@ -401,7 +427,7 @@ def test_delta_chunkwise_backward():
 
     y0 = forward_loop(q1, k1, v1, beta1)
     
-    y1 = forward_chunkwise(q1, k1, v1, beta1, chunk_size=2)
+    w1, u1, y1 = forward_chunkwise(q1, k1, v1, beta1, chunk_size=2)
     (y1 - torch.ones_like(y1).detach()).pow(2).mean().backward()
 
     q, k, v, beta = make_example(NH, T, D)
