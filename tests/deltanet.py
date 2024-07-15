@@ -326,47 +326,49 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
         state_decay = einsum('nvk,ntk->ntv', state, w[:, c])
         u[:, c] = u[:, c] - state_decay
         state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
-        state = state + state_delta
+        if c < C-1:
+            state = state + state_delta
 
     # from now on, u's are decayed
 
     # stitch backward
-    for c in range(C-1, -1, -1):
+    for c in range(C-1, 0, -1):
         d_u[:, c] = einsum('nvk,ntk->ntv', d_state, k_[:, c]) # state_add
 
-        if c == 0:
-            d_k_[:, c] = einsum('nvk,ntv->ntk', d_state, u[:, c]) # state_add
-        else:
+        if c < C-1:
             state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
             state = state - state_delta # uncompute the state
             state_decay = einsum('nvk,ntk->ntv', state, w[:, c])
 
-            d_q1 = einsum('nsv,nvk->nsk', d_y_delta[:, c], state) # prev_output
+        d_q1 = einsum('nsv,nvk->nsk', d_y_delta[:, c], state) # prev_output
 
-            # causal_attend_backward for delta
-            d_out_att = -d_y_delta[:, c]
-            d_out_state_decays = einsum('nsv,ntv->nst', d_out_att, state_decay)
-            d_out_state_decays.tril_()
-            d_q2 = einsum('nst,ntk->nsk', d_out_state_decays, k_[:, c])
-            d_k1 = einsum('nst,nsk->ntk', d_out_state_decays, q_[:, c])
-            d_q_[:, c] = d_q1 + d_q2
+        # causal_attend_backward for delta
+        d_out_att = -d_y_delta[:, c]
+        d_out_state_decays = einsum('nsv,ntv->nst', d_out_att, state_decay)
+        d_out_state_decays.tril_()
+        d_q2 = einsum('nst,ntk->nsk', d_out_state_decays, k_[:, c])
+        d_k1 = einsum('nst,nsk->ntk', d_out_state_decays, q_[:, c])
+        d_q_[:, c] = d_q1 + d_q2
 
-            d_k2 = einsum('nvk,ntv->ntk', d_state, u[:, c]) # state_add
-            d_k_[:, c] = d_k1 + d_k2
+        d_k2 = einsum('nvk,ntv->ntk', d_state, u[:, c]) # state_add
+        d_k_[:, c] = d_k1 + d_k2
 
-            d_state1 = einsum('nsv,nsk->nvk', d_y_delta[:, c], q_[:, c]) # prev_output
+        d_state1 = einsum('nsv,nsk->nvk', d_y_delta[:, c], q_[:, c]) # prev_output
 
-            qk = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
-            qk.tril_()
-            d_state_decays1 = einsum('nsv,nst->ntv', d_out_att, qk)
+        qk = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
+        qk.tril_()
+        d_state_decays1 = einsum('nsv,nst->ntv', d_out_att, qk)
 
-            d_state_decays2 = einsum('nvk,ntk->ntv', -d_state, k_[:, c]) # state_add
-            d_state_decays = d_state_decays1 + d_state_decays2
-            d_w[:, c] = einsum('ntv,nvk->ntk', d_state_decays, state) # state_decays
+        d_state_decays2 = einsum('nvk,ntk->ntv', -d_state, k_[:, c]) # state_add
+        d_state_decays = d_state_decays1 + d_state_decays2
+        d_w[:, c] = einsum('ntv,nvk->ntk', d_state_decays, state) # state_decays
 
-            d_state2 = einsum('ntv,ntk->nvk', d_state_decays, w[:, c]) # state_decays
-            d_state = d_state + d_state1 + d_state2
+        d_state2 = einsum('ntv,ntk->nvk', d_state_decays, w[:, c]) # state_decays
+        d_state = d_state + d_state1 + d_state2
 
+    d_u[:, 0] = einsum('nvk,ntk->ntv', d_state, k_[:, 0]) # state_add
+    d_k_[:, 0] = einsum('nvk,ntv->ntk', d_state, u[:, 0]) # state_add
+    
     return d_q_.view(NH, T, D), d_k_.view(NH, T, D), d_w.view(NH, T, D), d_u.view(NH, T, D)
 
 
