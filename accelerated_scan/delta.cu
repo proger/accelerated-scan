@@ -234,9 +234,9 @@ static __device__ inline void decay_values_forward(
 }
 
 
-template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8>
+template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
 __global__ void decay_values_forward_kernel(
-    int seqlen,
+    int num_chunks,
     const H* __restrict__ __q__,
     const H* __restrict__ __k__,
     const H* __restrict__ __v__,
@@ -246,8 +246,8 @@ __global__ void decay_values_forward_kernel(
     H* __restrict__ __y__
 ) {
     auto warpid           = kittens::warpid();
-    auto block_start      = blockIdx.x*(seqlen*_key*TILE_DIM);
-    auto beta_block_start = blockIdx.x*(seqlen*TILE_DIM); // width is 1 for beta
+    auto block_start      = blockIdx.x*(num_chunks*kChunkSize*(_key*TILE_DIM));
+    auto beta_block_start = blockIdx.x*(num_chunks*kChunkSize*1); // width is 1 for beta
     const T *_q = reinterpret_cast<const T *>(__q__) + block_start,
             *_k = reinterpret_cast<const T *>(__k__) + block_start,
             *_v = reinterpret_cast<const T *>(__v__) + block_start,
@@ -268,7 +268,7 @@ __global__ void decay_values_forward_kernel(
     rt<ACCUM, _time, _time> mma_TT;
     rt<ACCUM, _time, _key> mma_TD;
 
-    const int time_blocks = seqlen / (w_reg.rows*kNumWarps);
+    const int time_blocks = (num_chunks*kChunkSize) / (w_reg.rows*kNumWarps);
     int time_warp_index = warpid; // TODO
 
     /*
@@ -310,9 +310,9 @@ __global__ void decay_values_forward_kernel(
 }
 
 
-template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8>
+template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
 __global__ void decay_values_backward_kernel(
-    int seqlen,
+    int num_chunks,
     const H* __restrict__ __d_out_w__,
     const H* __restrict__ __d_out_u__,
     const H* __restrict__ __d_out_y__,
@@ -329,8 +329,8 @@ __global__ void decay_values_backward_kernel(
     H* __restrict__ __y__
 ) {
     auto warpid           = kittens::warpid();
-    auto block_start      = blockIdx.x*(seqlen*_key*TILE_DIM);
-    auto beta_block_start = blockIdx.x*(seqlen*TILE_DIM); // width is 1 for beta
+    auto block_start      = blockIdx.x*(num_chunks*kChunkSize*(_key*TILE_DIM));
+    auto beta_block_start = blockIdx.x*(num_chunks*kChunkSize*1); // width is 1 for beta
     const T *_d_out_w = reinterpret_cast<const T *>(__d_out_w__) + block_start,
             *_d_out_u = reinterpret_cast<const T *>(__d_out_u__) + block_start,
             *_d_out_y = reinterpret_cast<const T *>(__d_out_y__) + block_start,
@@ -370,8 +370,7 @@ __global__ void decay_values_backward_kernel(
     rt<ACCUM, _time, _time> mma_TT;
     rt<ACCUM, _time, _key> mma_TD;
 
-    const int time_blocks = seqlen / (w_reg.rows*kNumWarps);
-    //printf("seqlen: %d time_blocks: %d rows: %d\n", seqlen, time_blocks, w_reg.rows);
+    const int time_blocks = (num_chunks*kChunkSize) / (w_reg.rows*kNumWarps);
 
     // int time_warp_index = time_blocks*kNumWarps + warpid;
     int time_warp_index = warpid; // TODO
@@ -609,25 +608,25 @@ __global__ void decay_values_backward_kernel(
         if (seqlen == 16) { \
             TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1)); \
         } else { \
-            TORCH_CHECK(false, "[kvb].size(1) should be 16"); \
+            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
         } \
     } else if (d == 32) { \
         if (seqlen == 16) { \
             TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1)); \
         } else { \
-            TORCH_CHECK(false, "[kvb].size(1) should be 16"); \
+            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
         } \
     } else if (d == 64) { \
         if (seqlen == 16) { \
             TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 4, 1)); \
         } else { \
-            TORCH_CHECK(false, "[kvb].size(1) should be 16"); \
+            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
         } \
     } else if (d == 128) { \
         if (seqlen == 16) { \
             TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 8, 1)); \
         } else { \
-            TORCH_CHECK(false, "[kvb].size(1) should be 16"); \
+            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
         } \
     } else { \
         TORCH_CHECK(false, "[qkv].size(2) should be 16, 32, 64 or 128"); \
@@ -660,6 +659,8 @@ decay_values_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
         same &= q.size(i) == v.size(i);
     }
     TORCH_CHECK(same, "Q, K and V should be same size");
+    constexpr int kChunkSize = 16;
+    auto num_chunks = seqlen / kChunkSize;
 
     // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
     // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
@@ -672,8 +673,8 @@ decay_values_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps><<<batch_head,threads,mem_size>>>( \
-            (int)seqlen, \
+        decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
+            (int)num_chunks, \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             w.data_ptr<H>(), u.data_ptr<H>(), y.data_ptr<H>())
 
@@ -723,6 +724,8 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
         same &= q.size(i) == v.size(i);
     }
     TORCH_CHECK(same, "Q, K and V should be same size");
+    constexpr int kChunkSize = 16;
+    auto num_chunks = seqlen / kChunkSize;
 
     // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
     // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
@@ -735,8 +738,8 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps><<<batch_head,threads,mem_size>>>( \
-            (int)seqlen, \
+        decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
+            (int)num_chunks, \
             d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(), d_out_y.data_ptr<H>(), \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             d_q.data_ptr<H>(), d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \

@@ -58,7 +58,7 @@ def tileprint(K, name='K'):
         ]))
 
 
-def decay_values_forward(q_, k_, v_, beta_):
+def decay_values(q_, k_, v_, beta_):
     chunk_size = k_.size(1)
 
     # evaluate all chunks in parallel
@@ -88,7 +88,7 @@ def forward(q, k, v, beta, chunk_size=2):
         v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
     )
 
-    w, u, y = decay_values_forward(q_, k_, v_, beta_)
+    w, u, y = decay_values(q_, k_, v_, beta_)
 
     # stitch chunks sequentially
     q_ = q.view(NH, C, chunk_size, D)
