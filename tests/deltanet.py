@@ -368,7 +368,7 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
 
     d_u[:, 0] = einsum('nvk,ntk->ntv', d_state, k_[:, 0]) # state_add
     d_k_[:, 0] = einsum('nvk,ntv->ntk', d_state, u[:, 0]) # state_add
-    
+
     return d_q_.view(NH, T, D), d_k_.view(NH, T, D), d_w.view(NH, T, D), d_u.view(NH, T, D)
 
 
