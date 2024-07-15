@@ -1,13 +1,8 @@
 """
 DeltaNet implementation reference for Accelerated Scan.  DeltaNet performs efficient management of a large fixed-sized memory.
 
-For a simple single chunk version see `forward_simple`.
-It computes decayed values by a little bit of recurrence and then applies linear attention (`decay_values`).
-
-`forward_chunkwise` is inspired by Yang 2024. It applies single chunk version pointwise and
-then performs chunk-level stitching.
-
-forward_loop is the reference implementation of the original recurrence.
+`forward` is inspired by Yang 2024. It applies single chunk version pointwise and then performs chunk-level stitching.
+`forward_loop` is the reference implementation of the original recurrence.
 
 References:
 [1] The WY Representation for Products of Householder Matrices (Bischof and Van Loan 1985)
@@ -63,28 +58,29 @@ def tileprint(K, name='K'):
         ]))
 
 
-def decay_values(q, k, v, beta):
-    "decay values applying deltanet forgetting rules"
-    NH, T, D = shape(q, k, v, beta)
+def decay_values_forward(q_, k_, v_, beta_):
+    chunk_size = k_.size(1)
 
-    beta_ = beta.unsqueeze(-1)
-    w = beta_ * k.clone()
-    u = beta_ * v.clone()
-    K = einsum('nsd,ntd->nst', k, k) # (T,T) matrix
+    # evaluate all chunks in parallel
+    beta__ = beta_.unsqueeze(-1)
+    w = beta__ * k_.clone()
+    u = beta__ * v_.clone()
+    K = einsum('nsd,ntd->nst', k_, k_) # (chunk_size,chunk_size) matrix
 
-    for t in range(1,T):
-        w[:, t] -= beta_[:, t] * einsum('nt,ntd->nd', K[:, :t, t], w[:, :t].clone())
-        u[:, t] -= beta_[:, t] * einsum('nt,ntd->nd', K[:, :t, t], u[:, :t].clone())
+    for t in range(1,chunk_size):
+        w[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, :t, t], w[:, :t].clone())
+        u[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, :t, t], u[:, :t].clone())
 
     # attend to decayed values
-    qk = einsum("nsk,ntk->nst", q, k)
+    qk = einsum("nsk,ntk->nst", q_, k_)
     qk.tril_()
     y = einsum("nst,ntj->nsj", qk, u)
 
     return w, u, y
 
 
-def forward_chunkwise(q, k, v, beta, chunk_size=2):
+def forward(q, k, v, beta, chunk_size=2):
+    "decay values applying deltanet forgetting rules, then stitch chunks"
     NH, T, D = shape(q, k, v, beta)
     C = T // chunk_size
     q_, k_, v_, beta_ = (
@@ -92,8 +88,7 @@ def forward_chunkwise(q, k, v, beta, chunk_size=2):
         v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
     )
 
-    # evaluate all chunks in parallel
-    w, u, y = decay_values(q_, k_, v_, beta_)
+    w, u, y = decay_values_forward(q_, k_, v_, beta_)
 
     # stitch chunks sequentially
     q_ = q.view(NH, C, chunk_size, D)
@@ -101,18 +96,27 @@ def forward_chunkwise(q, k, v, beta, chunk_size=2):
     u = u.view(NH, C, chunk_size, D)
     w = w.view(NH, C, chunk_size, D)
 
-    # materialize the state for the leading chunk    
+    # materialize the state for the leading chunk
     state = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
     y_deltas = [u.new_zeros(NH, chunk_size, D)]
     for c in range(1, C):
-        u_old = einsum('nvk,ntk->ntv', state, w[:, c])
-        y_cur = einsum('nvk,nsk->nsv', state, q_[:, c])
-        
+        if c == 1:
+            # early on this could be cheaper than a state query
+            kw = einsum('nsk,ntk->nst', k_[:, c-1], w[:, c]) # TDT
+            u_old = einsum('nsv,nst->ntv', u[:, c-1], kw) # TDT
+
+            kq = einsum('nsk,ntk->nst', k_[:, c-1], q_[:, c]) # TDT
+            y_cur = einsum('nsv,nst->ntv', u[:, c-1], kq) # TTD            
+        else:
+            u_old = einsum('nvk,ntk->ntv', state, w[:, c]) # DDT
+            y_cur = einsum('nvk,nsk->nsv', state, q_[:, c]) # DDT
+
         # attend to old values
-        qk = einsum("nsi,nti->nst", q_[:, c], k_[: ,c])
+        qk = einsum("nsi,nti->nst", q_[:, c], k_[: ,c]) # TDT
         qk = qk.tril()
-        y_prev = einsum("nst,ntj->nsj", qk, u_old)
+
+        y_prev = einsum("nst,ntv->nsv", qk, u_old) # TTD
 
         y_deltas.append(y_cur - y_prev)
 
@@ -173,7 +177,6 @@ def make_example(NH, T, D, device='cpu', dtype=torch.float32):
     beta.requires_grad_()
     return q, k, v, beta
 
-#%%
 
 @no_grad()
 def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
@@ -307,24 +310,34 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
 def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     NH, T, D = shape(q, k, None, None)
 
-    d_y_delta = d_y_delta.view(NH, C, chunk_size, D)
-    q_ = q.view(NH, C, chunk_size, D)
-    k_ = k.view(NH, C, chunk_size, D)
-    u = u.view(NH, C, chunk_size, D).clone()
-    w = w.view(NH, C, chunk_size, D)
-
+    # outputs
     d_q_ = q.new_zeros(NH, C, chunk_size, D)
     d_k_ = k.new_zeros(NH, C, chunk_size, D)
     d_w = w.new_zeros(NH, C, chunk_size, D)
     d_u = u.new_zeros(NH, C, chunk_size, D)
+
+    # chunked inputs
+    d_y_delta = d_y_delta.view(NH, C, chunk_size, D)
+    q_ = q.view(NH, C, chunk_size, D)
+    k_ = k.view(NH, C, chunk_size, D)
+    w = w.view(NH, C, chunk_size, D)
+
+    # shared memory copy
+    u = u.view(NH, C, chunk_size, D).clone()
+
+    state = w.new_zeros(NH, D, D)
     d_state = w.new_zeros(NH, D, D) # NHVK
+    state_delta = w.new_zeros(NH, D, D) # NHVK # can this be float32?
+
+    tt = k.new_zeros(NH, chunk_size, C)
+    tk = k.new_zeros(NH, chunk_size, D)
 
     # materialize the state for the leading chunk
     state = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
     for c in range(1, C):
-        state_decay = einsum('nvk,ntk->ntv', state, w[:, c])
-        u[:, c] = u[:, c] - state_decay
+        tk = einsum('nvk,ntk->ntv', state, w[:, c])
+        u[:, c] = u[:, c] - tk
         state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
         if c < C-1:
             state = state + state_delta
@@ -333,41 +346,58 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
 
     # stitch backward
     for c in range(C-1, 0, -1):
-        d_u[:, c] = einsum('nvk,ntk->ntv', d_state, k_[:, c]) # state_add
+        d_y_delta_c = d_y_delta[:, c]
+        d_y_delta_c = -d_y_delta_c # neg
 
         if c < C-1:
             state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
             state = state - state_delta # uncompute the state
-            state_decay = einsum('nvk,ntk->ntv', state, w[:, c])
+            tk = einsum('nvk,ntk->ntv', state, w[:, c]) # state_decay
 
-        d_q1 = einsum('nsv,nvk->nsk', d_y_delta[:, c], state) # prev_output
+        # d_q, d_k
+        tt = einsum('nsv,ntv->nst', d_y_delta_c, tk)
+        tt.tril_()
 
-        # causal_attend_backward for delta
-        d_out_att = -d_y_delta[:, c]
-        d_out_state_decays = einsum('nsv,ntv->nst', d_out_att, state_decay)
-        d_out_state_decays.tril_()
-        d_q2 = einsum('nst,ntk->nsk', d_out_state_decays, k_[:, c])
-        d_k1 = einsum('nst,nsk->ntk', d_out_state_decays, q_[:, c])
-        d_q_[:, c] = d_q1 + d_q2
+        # d_q
+        tk = einsum('nst,ntk->nsk', tt, k_[:, c]) # causal_attend_backward for delta
+        tk.sub_(einsum('nsv,nvk->nsk', d_y_delta_c, state)) # prev_output
+        d_q_[:, c] = tk
 
-        d_k2 = einsum('nvk,ntv->ntk', d_state, u[:, c]) # state_add
-        d_k_[:, c] = d_k1 + d_k2
+        # d_k
+        tk = einsum('nst,nsk->ntk', tt, q_[:, c])
+        if c < C-1:
+            tk.add_(einsum('nvk,ntv->ntk', d_state, u[:, c])) # state_add
+        else:
+            # d_state is zero
+            pass
+        d_k_[:, c] = tk
 
-        d_state1 = einsum('nsv,nsk->nvk', d_y_delta[:, c], q_[:, c]) # prev_output
+        # d_u
+        if c < C-1:
+            d_u[:, c] = einsum('nvk,ntk->ntv', d_state, k_[:, c]) # state_add
+        else:
+            # d_state is zero
+            pass
 
-        qk = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
-        qk.tril_()
-        d_state_decays1 = einsum('nsv,nst->ntv', d_out_att, qk)
+        # d_state_decays
+        tt = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
+        tt.tril_()
+        d_state_decays = einsum('nsv,nst->ntv', d_y_delta_c, tt)
+        if c < C-1:
+            d_state_decays.sub_(einsum('nvk,ntk->ntv', d_state, k_[:, c])) # state_add
 
-        d_state_decays2 = einsum('nvk,ntk->ntv', -d_state, k_[:, c]) # state_add
-        d_state_decays = d_state_decays1 + d_state_decays2
-        d_w[:, c] = einsum('ntv,nvk->ntk', d_state_decays, state) # state_decays
+        # d_w
+        tk = einsum('ntv,nvk->ntk', d_state_decays, state)
+        d_w[:, c] = tk # state_decays
 
-        d_state2 = einsum('ntv,ntk->nvk', d_state_decays, w[:, c]) # state_decays
-        d_state = d_state + d_state1 + d_state2
+        # backpropagate through time
+        d_state.sub_(einsum('nsv,nsk->nvk', d_y_delta_c, q_[:, c])) # prev_output
+        d_state.add_(einsum('ntv,ntk->nvk', d_state_decays, w[:, c])) # state_decays
 
-    d_u[:, 0] = einsum('nvk,ntk->ntv', d_state, k_[:, 0]) # state_add
-    d_k_[:, 0] = einsum('nvk,ntv->ntk', d_state, u[:, 0]) # state_add
+    tk = einsum('nvk,ntk->ntv', d_state, k_[:, 0])
+    d_u[:, 0] = tk # state_add
+    tk = einsum('nvk,ntv->ntk', d_state, u[:, 0])
+    d_k_[:, 0] = tk # state_add
 
     return d_q_.view(NH, T, D), d_k_.view(NH, T, D), d_w.view(NH, T, D), d_u.view(NH, T, D)
 
@@ -375,7 +405,7 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
 class DeltaChunkwise(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, beta, chunk_size):
-        w, u, y = forward_chunkwise(q, k, v, beta, chunk_size)
+        w, u, y = forward(q, k, v, beta, chunk_size)
         ctx.save_for_backward(q, k, v, beta, w, u)
         ctx.chunk_size = chunk_size
         return y
@@ -415,19 +445,20 @@ class DeltaChunkwise(torch.autograd.Function):
 
 
 def test_delta_chunkwise_backward():
-    NH, T, D = 2, 16, 2
+    NH, T, D = 2, 16, 3
     q1, k1, v1, beta1 = make_example(NH, T, D)
 
     y0 = forward_loop(q1, k1, v1, beta1)
     
-    w1, u1, y1 = forward_chunkwise(q1, k1, v1, beta1, chunk_size=2)
+    w1, u1, y1 = forward(q1, k1, v1, beta1, chunk_size=2)
     (y1 - torch.ones_like(y1).detach()).pow(2).mean().backward()
+
+    assert allclose(y0, y1, atol=1e-5), 'y1 is wrong'
 
     q, k, v, beta = make_example(NH, T, D)
     y = DeltaChunkwise.apply(q, k, v, beta, 2)
     (y - torch.ones_like(y).detach()).pow(2).mean().backward()
 
-    assert allclose(y0, y1, atol=1e-5), 'y1 is wrong'
     assert allclose(y1, y, atol=1e-5), 'y is wrong'
 
     # print(beta1.grad - beta.grad, 'beta.grad diff')
