@@ -303,8 +303,6 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
 
     return d_q, d_k, d_v, d_beta
 
-# %%
-
 
 def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     NH, T, D = shape(q, k, None, None)
@@ -320,7 +318,6 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     d_w = w.new_zeros(NH, C, chunk_size, D)
     d_u = u.new_zeros(NH, C, chunk_size, D)
     d_state = w.new_zeros(NH, D, D) # NHVK
-    y_delta = u.new_zeros(NH, C, chunk_size, D) # leading chunk has zero delta
 
     # storing all states for BPTT
     states = k.new_zeros(NH, C, D, D) # NHCVK
@@ -330,14 +327,6 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     # stitch forward
     for c in range(1, C):
         u_old = einsum('nvk,ntk->ntv', states[:, c-1], w[:, c])
-        y_cur = einsum('nvk,nsk->nsv', states[:, c-1], q_[:, c])
-        
-        # attend to old values
-        qk = einsum("nsi,nti->nst", q_[:, c], k_[: ,c])
-        qk = qk.tril()
-        y_prev = einsum("nst,ntj->nsj", qk, u_old)
-        y_delta[:, c] = y_cur - y_prev
-
         state_delta = einsum('ntv,ntk->nvk', u[:, c] - u_old, k_[:, c])
         states[:, c] = states[:, c-1] + state_delta
 
