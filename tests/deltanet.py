@@ -95,39 +95,44 @@ def forward(q, k, v, beta, chunk_size=2):
     k_ = k.view(NH, C, chunk_size, D)
     u = u.view(NH, C, chunk_size, D)
     w = w.view(NH, C, chunk_size, D)
+    y = y.view(NH, C, chunk_size, D)
 
     # materialize the state for the leading chunk
-    state = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
-    y_deltas = [u.new_zeros(NH, chunk_size, D)]
+    kc = k_[:, 0]
+    uc = u[:, 0]
+
+    state = u.new_zeros(NH, D, D)
+
     for c in range(1, C):
-        if c == 1:
-            # early on this could be cheaper than a state query
-            kw = einsum('nsk,ntk->nst', k_[:, c-1], w[:, c]) # TDT
-            u_old = einsum('nsv,nst->ntv', u[:, c-1], kw) # TDT
+        state = state + einsum('ntv,ntk->nvk', uc, kc)
 
-            kq = einsum('nsk,ntk->nst', k_[:, c-1], q_[:, c]) # TDT
-            y_cur = einsum('nsv,nst->ntv', u[:, c-1], kq) # TTD            
-        else:
-            u_old = einsum('nvk,ntk->ntv', state, w[:, c]) # DDT
-            y_cur = einsum('nvk,nsk->nsv', state, q_[:, c]) # DDT
+        wc = w[:, c] # load w
+        uc = einsum('ntk,nvk->ntv', wc, state) # DDT
+
+        qc = q_[:, c] # load q
+        kc = k_[:, c] # load k
 
         # attend to old values
-        qk = einsum("nsi,nti->nst", q_[:, c], k_[: ,c]) # TDT
+        qk = einsum("nsi,nti->nst", qc, kc) # TDT
         qk = qk.tril()
 
-        y_prev = einsum("nst,ntv->nsv", qk, u_old) # TTD
+        yc = y[:, c].clone() # load y
 
-        y_deltas.append(y_cur - y_prev)
+        y_prev = einsum("nst,ntv->nsv", qk, uc) # TTD
+        yc = yc - y_prev
 
-        state_delta = einsum('ntv,ntk->nvk', u[:, c] - u_old, k_[:, c])
-        state = state + state_delta
+        y_cur = einsum('nsk,nvk->nsv', qc, state) # DDT
+        yc = yc + y_cur
 
-    y_delta = torch.stack(y_deltas, dim=1)
+        y[:, c] = yc # store
+
+        u1 = u[:, c] # load u
+        uc = u1 - uc
 
     w = w.view(NH, T, D)
     u = u.view(NH, T, D)
-    y = y.view(NH, T, D) + y_delta.view(NH, T, D)
+    y = y.view(NH, T, D)
 
     return w, u, y
 
@@ -335,24 +340,25 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     # materialize the state for the leading chunk
     state = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
+    # stitch forward
     for c in range(1, C):
         tk = einsum('nvk,ntk->ntv', state, w[:, c])
         u[:, c] = u[:, c] - tk
         state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
         if c < C-1:
-            state = state + state_delta
+            state = state + state_delta # walk the state forwards
 
     # from now on, u's are decayed
 
     # stitch backward
     for c in range(C-1, 0, -1):
-        d_y_delta_c = d_y_delta[:, c]
-        d_y_delta_c = -d_y_delta_c # neg
-
         if c < C-1:
             state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
-            state = state - state_delta # uncompute the state
+            state = state - state_delta # uncompute the state backwards
             tk = einsum('nvk,ntk->ntv', state, w[:, c]) # state_decay
+
+        d_y_delta_c = d_y_delta[:, c]
+        d_y_delta_c = -d_y_delta_c # neg
 
         # d_q, d_k
         tt = einsum('nsv,ntv->nst', d_y_delta_c, tk)
