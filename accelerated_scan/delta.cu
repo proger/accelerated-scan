@@ -234,9 +234,9 @@ static __device__ inline void decay_values_forward(
 }
 
 
-template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
-__global__ void decay_values_forward_kernel(
-    int num_chunks,
+template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 1, int kChunkSize = 16>
+__global__ void forward_kernel(
+    const int num_chunks,
     const H* __restrict__ __q__,
     const H* __restrict__ __k__,
     const H* __restrict__ __v__,
@@ -268,45 +268,365 @@ __global__ void decay_values_forward_kernel(
     rt<ACCUM, _time, _time> mma_TT;
     rt<ACCUM, _time, _key> mma_TD;
 
-    const int time_blocks = (num_chunks*kChunkSize) / (w_reg.rows*kNumWarps);
-    int time_warp_index = warpid; // TODO
+    for (int time_block = 0; time_block < num_chunks / kNumWarps; time_block++) {
+        int time_index = time_block * kNumWarps + warpid;
+
+        /*
+        * load k, v, beta
+        */
+
+        load(k_reg, _k + time_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
+        load(v_reg, _v + time_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
+        load(beta_reg, _beta + time_index*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
+
+        /*
+        * decay_values_forward: compute w and u
+        */
+
+        decay_values_forward(mma_TT, mma_TD, tt_reg, tt_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, v_reg, bk_reg, tk_reg);
+
+        store(_w + time_index*u_reg.num_elements, w_reg, w_reg.cols);
+        store(_u + time_index*u_reg.num_elements, u_reg, u_reg.cols);
+
+        /*
+        * attend to decayed values
+        */
+
+        auto &q_reg = w_reg;
+        load(q_reg, _q + time_index*q_reg.num_elements, q_reg.cols); // q = q.clone()
+
+        zero(mma_TT);
+        mma_ABt(mma_TT, q_reg, k_reg, mma_TT); // mma_TT = einsum('nsk,ntk->nst', q, k)
+        copy(tt_reg, mma_TT);
+        make_causal(tt_reg, tt_reg, 0); // tt.tril_()
+
+        zero(mma_TD);
+        col &u_reg_col = swap_layout_inplace(u_reg);
+        mma_AB(mma_TD, tt_reg, u_reg_col, mma_TD); // mma_TD = einsum('nst,ntw->ntw', tt, u)
+        auto &y_reg = w_reg;
+        copy(y_reg, mma_TD);
+
+        store(_y + time_index*y_reg.num_elements, y_reg, y_reg.cols);
+    }
+
+    __syncthreads();
+
+    if (warpid == 0) {
+        loop<T, D, ACCUM, _time, _key, _value, kChunkSize>(_q, _k, _w, _u, _y, num_chunks);
+    }
+}
+
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kChunkSize>
+__device__ static void loop(
+    const T *_q,
+    const T *_k,
+    const T *_w,
+    const T *_u,
+    T *_y,
+    const int num_chunks
+) {
+    rt<D, _value, _key> state;
+    rt<ACCUM, _value, _key> mma_state;
+    rt<ACCUM, _time, _value> mma_value;
+    rt<D, _time, _key> q, k, w;
+    rt<D, _time, _value> u, y;
+    rt<ACCUM, _time, _time> mma_qk;
+    rt<D, _time, _time> qk;
+
+    int chunk = 0;
+
+    load(k, _k + chunk*k.num_elements, k.cols);
+    load(u, _u + chunk*u.num_elements, u.cols);
+    zero(mma_state);
+
+    //mma_AtBt kt,vk->tv col row
+
+    //mma_AtBt xt,sx->ts
+    //mma_AtB  tv,tk->vk col col
+    //mma_ABt vk,tk->vt row row
+    //mma_ABt tk,vk->tv row row
+    //mma_ABt st,tv->sv row row
+    //mma_AB st,tv ->sv row col
+
+    for (chunk = 1; chunk < num_chunks; chunk++) {
+        auto &k_col = swap_layout_inplace(k);
+        auto &u_col = swap_layout_inplace(u);
+        mma_AtB(mma_state, u_col, k_col, mma_state);
+        k = swap_layout_inplace(k_col);
+        u = swap_layout_inplace(u_col);
+        copy(state, mma_state);
+
+        load(w, _w + chunk*w.num_elements, w.cols);
+
+        zero(mma_value);
+        mma_ABt(mma_value, w, state, mma_value); // u_old
+        copy(u, mma_value); // u = u_old
+
+        load(q, _q + chunk*q.num_elements, q.cols);
+        load(k, _k + chunk*k.num_elements, k.cols);
+
+        zero(mma_qk);
+        mma_ABt(mma_qk, q, k, mma_qk); // qk = einsum('nsk,ntk->nst', q, k)
+        copy(qk, mma_qk);
+        make_causal(qk, qk, 0);
+
+        load(y, _y + chunk*y.num_elements, y.cols);
+        {
+            zero(mma_value);
+            auto &u_col1 = swap_layout_inplace(u);
+            mma_AB(mma_value, qk, u_col1, mma_value); // y_prev
+            u = swap_layout_inplace(u_col1);
+            auto &y_prev = w; // repurpose w
+            copy(y_prev, mma_value);
+            sub(y, y, y_prev);
+
+            zero(mma_value);
+            mma_ABt(mma_value, q, state, mma_value); // y_cur
+            auto &y_cur = w; // repurpose w again
+            copy(y_cur, mma_value);
+            add(y, y, y_cur);
+        }
+        store(_y + chunk*y.num_elements, y, y.cols);
+
+        auto &u1 = y; // repurpose y
+        load(u1, _u + chunk*u1.num_elements, u1.cols);
+        sub(u, u1, u);
+    }
+}
+
+/**
+ * @brief Bind a list of vectors (k,u) and write them to a dictionary state_delta.
+ */
+template <typename D, typename ACCUM, int _time, int _key, int _value>
+__device__ static void associate(
+    rt<D, _value, _key, ducks::rt_layout::row> &state_delta,
+    const rt<D, _time, _value, ducks::rt_layout::row> &v,
+    const rt<D, _time, _key, ducks::rt_layout::row> &k
+) {
+    rt<ACCUM, _value, _key> mma_state;
+
+    zero(mma_state);
+    auto &k_col = swap_layout_inplace(k);
+    auto &v_col = swap_layout_inplace(v);
+    mma_AtB(mma_state, v_col, k_col, mma_state);
+    swap_layout_inplace(k_col);
+    swap_layout_inplace(v_col);
+    copy(state_delta, mma_state);
+}
+
+template <typename D, typename ACCUM, int _time, int _key, int _value>
+__device__ static void query(
+    rt<D, _time, _value, ducks::rt_layout::row> &output_values,
+    const rt<D, _value, _key, ducks::rt_layout::row> &state,
+    const rt<D, _time, _key, ducks::rt_layout::row> &query
+) {
+    rt<ACCUM, _time, _value> mma;
+
+    zero(mma);
+    mma_ABt(mma, query, state, mma); // einsum('tk,vk->tv', query, state)
+    copy(output_values, mma);
+}
+
+template <typename D, typename ACCUM, int _time, int _key, int _value>
+__device__ static void reverse_query(
+    rt<D, _time, _key, ducks::rt_layout::row> &output_keys,
+    const rt<D, _time, _value, ducks::rt_layout::row> &value_query,
+    const rt<D, _value, _key, ducks::rt_layout::row> &state
+) {
+    rt<ACCUM, _time, _key> mma;
+
+    zero(mma);
+    auto &state_col = swap_layout_inplace(state);
+    mma_AB(mma, value_query, state_col, mma); // einsum('tv,vk->tk', value_query, state)
+    copy(output_keys, mma);
+    swap_layout_inplace(state_col);
+}
+
+
+template <typename D, typename ACCUM, int _time_source, int _time_target, int _key>
+__device__ static void kernel(
+    rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
+    const rt<D, _time_source, _key, ducks::rt_layout::row> &query,
+    const rt<D, _time_target, _key, ducks::rt_layout::row> &key
+) {
+    rt<ACCUM, _time_source, _time_target> qk;
+
+    zero(qk);
+    mma_ABt(qk, query, key, qk); // mma_TT = einsum('nsk,ntk->nst', q, k)
+    copy(attention, qk);
+}
+
+template <typename D, typename ACCUM, int _time_source, int _time_target, int _value>
+__device__ static void attend(
+    rt<D, _time_source, _value, ducks::rt_layout::row> &mixtures,
+    const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
+    const rt<D, _time_target, _value, ducks::rt_layout::row> &values
+) {
+    rt<ACCUM, _time_source, _value> mma;
+
+    zero(mma);
+    auto &values_col = swap_layout_inplace(values);
+    mma_AB(mma, attention, values_col, mma);
+    copy(mixtures, mma);
+    swap_layout_inplace(values_col);
+}
+
+template <typename D, typename ACCUM, int _time_source, int _time_target, int _value>
+__device__ static void reverse_attend(
+    rt<D, _time_target, _value, ducks::rt_layout::row> &mixtures,
+    const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
+    const rt<D, _time_source, _value, ducks::rt_layout::row> &source_values
+) {
+    rt<ACCUM, _time_target, _value> mma;
+
+    zero(mma);
+    auto &attention_col = swap_layout_inplace(attention);
+    auto &source_values_col = swap_layout_inplace(source_values);
+    mma_AtB(mma, attention, source_values_col, mma);
+    copy(mixtures, mma);
+    swap_layout_inplace(attention_col);
+    swap_layout_inplace(source_values_col);
+}
+
+struct op_negate {
+    template<typename T> static __device__ inline T op(const T &x) { return -x; }
+};
+
+template<ducks::rt::all T>
+__device__ static inline void negate(T &dst) {
+    unary_map<op_negate, T>(dst, dst);
+}
+
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kChunkSize>
+__device__ static void loop_backward(
+    const T *_d_y,
+    const T *_q,
+    const T *_k,
+    const T *_w,
+    T *_u, // will be updated
+    T *_d_q,
+    T *_d_k,
+    T *_d_w,
+    T *_d_u,
+    const int num_chunks
+) {
+    rt<D, _value, _key> state, d_state, state_delta;
+    rt<D, _time, _time> qk;
+    rt<D, _time, _key> tk, q, k, w;
+    rt<ACCUM, _time, _key> mma_tk;
+    rt<D, _time, _value> d_y, u, d_u, d_state_decays;
+    rt<D, _time, _key> d_q, d_k;
+
+    int chunk = 0;
 
     /*
-     * load k, v, beta
+     * recompute the loop forward
      */
 
-    load(k_reg, _k + time_warp_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
-    load(v_reg, _v + time_warp_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
-    load(beta_reg, _beta + time_warp_index); // beta = beta.clone()
+    load(k, _k + chunk*k.num_elements, k.cols);
+    load(u, _u + chunk*u.num_elements, u.cols);
+    
+    associate(state_delta, u, k);
+
+    for (chunk = 1; chunk < num_chunks; chunk++) {
+        load(w, _w + chunk*w.num_elements, w.cols);
+        load(u, _u + chunk*u.num_elements, u.cols);
+
+        query(tk, state, w);
+        sub(u, u, tk);
+        store(_u + chunk*u.num_elements, u, u.cols);
+
+        load(k, _k + chunk*k.num_elements, k.cols);
+        associate(state_delta, u, k);
+
+        if (chunk < num_chunks - 1) {
+            add(state, state, state_delta);
+        }
+    }
 
     /*
-     * decay_values_forward: compute w and u
+     * from now on, u's in global memory are decayed
+     *
+     * loop backward
      */
 
-    decay_values_forward(mma_TT, mma_TD, tt_reg, tt_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, v_reg, bk_reg, tk_reg);
+    zero(d_state);
 
-    store(_w, w_reg, w_reg.cols);
-    store(_u, u_reg, u_reg.cols);
+    for (chunk = num_chunks - 1; chunk > 0; chunk--) {
+        load(u, _u + chunk*u.num_elements, u.cols);
+        load(k, _k + chunk*k.num_elements, k.cols);
+        load(w, _w + chunk*w.num_elements, w.cols);
 
-    /*
-     * attend to decayed values
-     */
+        // we already have state_delta set up correctly in the first iteration
+        if (chunk < num_chunks - 1) {
+            associate(state_delta, u, k);
+            /*
+             * uncompute the state backwards -- take that nonlinear models!
+             */
+            sub(state, state, state_delta);
+            query(tk, state, w);
+        }
 
-    auto &q_reg = w_reg;
-    load(q_reg, _q + time_warp_index*q_reg.num_elements, q_reg.cols); // q = q.clone()
+        load(d_y, _d_y + chunk*d_y.num_elements, d_y.cols);
+        negate(d_y);
 
-    zero(mma_TT);
-    mma_ABt(mma_TT, q_reg, k_reg, mma_TT); // mma_TT = einsum('nsk,ntk->nst', q, k)
-    copy(tt_reg, mma_TT);
-    make_causal(tt_reg, tt_reg, 0); // tt.tril_()
+        // d_q, d_k
+        kernel(qk, d_y, tk);
+        make_causal(qk, qk, 0);
 
-    zero(mma_TD);
-    col &u_reg_col = swap_layout_inplace(u_reg);
-    mma_AB(mma_TD, tt_reg, u_reg_col, mma_TD); // mma_TD = einsum('nst,ntw->ntw', tt, u)
-    auto &y_reg = w_reg;
-    copy(y_reg, mma_TD);
+        // d_q
+        attend(d_q, qk, k);
+        reverse_query(tk, d_y, state);
+        sub(d_q, d_q, tk);
+        store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
 
-    store(_y, y_reg, y_reg.cols);
+        // d_k
+        attend(d_k, qk, q);
+        if (chunk < num_chunks - 1) {
+            reverse_query(tk, u, d_state); // otherwise we know d_state is zero
+            add(d_k, d_k, tk);
+        }
+        store(_d_k + chunk*d_k.num_elements, d_k, d_k.cols);
+
+        // d_u
+        if (chunk < num_chunks - 1) {
+            query(d_u, d_state, k); // otherwise we know d_state is zero
+            store(_d_u + chunk*d_u.num_elements, d_u, d_u.cols);
+        }
+
+        // d_state_decays
+        load(q, _q + chunk*q.num_elements, q.cols);
+        kernel(qk, q, k);
+        make_causal(qk, qk, 0);
+
+        auto &d_state_decays_buf = &d_u; // alias
+        reverse_attend(d_state_decays, qk, d_y);
+        if (chunk < num_chunks - 1) {
+            query(d_state_decays_buf, d_state, k);
+            sub(d_state_decays, d_state_decays, d_state_decays_buf);
+        }
+
+        // d_w
+        reverse_query(tk, d_state_decays, state);
+        store(_d_w + chunk*tk.num_elements, tk, tk.cols);
+
+        // backpropagate through time
+        auto &state_buf = state_delta; // alias
+        associate(state_buf, d_y, q);
+        sub(d_state, d_state, state_buf);
+        associate(state_buf, d_state_decays, w);
+        add(d_state, d_state, state_buf);
+    }
+
+    chunk = 0;
+    load(u, _u + chunk*u.num_elements, u.cols);
+    load(k, _k + chunk*k.num_elements, k.cols);
+
+    query(tk, d_state, k);
+    store(_d_u + chunk*tk.num_elements, tk, tk.cols);
+
+    reverse_query(tk, u, d_state);
+    store(_d_k + chunk*tk.num_elements, tk, tk.cols);
 }
 
 
@@ -605,35 +925,19 @@ __global__ void decay_values_backward_kernel(
 
 #define DISPATCH_ME(d, seqlen) \
     if (d == 16) { \
-        if (seqlen == 16) { \
-            TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1)); \
-        } else { \
-            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
-        } \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1)); \
     } else if (d == 32) { \
-        if (seqlen == 16) { \
-            TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1)); \
-        } else { \
-            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
-        } \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1)); \
     } else if (d == 64) { \
-        if (seqlen == 16) { \
-            TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 4, 1)); \
-        } else { \
-            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
-        } \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 4, 1)); \
     } else if (d == 128) { \
-        if (seqlen == 16) { \
-            TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 8, 1)); \
-        } else { \
-            TORCH_CHECK(false, "[qkvb].size(1) should be 16"); \
-        } \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 8, 1)); \
     } else { \
         TORCH_CHECK(false, "[qkv].size(2) should be 16, 32, 64 or 128"); \
     }
 
 void
-decay_values_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta, torch::Tensor w, torch::Tensor u, torch::Tensor y) {
+forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta, torch::Tensor w, torch::Tensor u, torch::Tensor y) {
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
@@ -650,7 +954,7 @@ decay_values_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
     TORCH_CHECK(u.scalar_type() == scalar_type, "u type mismatch");
     TORCH_CHECK(y.scalar_type() == scalar_type, "y type mismatch");
 
-    auto batch_head = k.size(0);
+    auto batch  = k.size(0);
     auto seqlen = k.size(1);
     auto d      = k.size(2);
     bool same = true;
@@ -672,8 +976,8 @@ decay_values_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
         unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
-        CHECK_CUDA_ERROR(cudaFuncSetAttribute(decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        decay_values_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
+        CHECK_CUDA_ERROR(cudaFuncSetAttribute(forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
+        forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch,threads,mem_size>>>( \
             (int)num_chunks, \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             w.data_ptr<H>(), u.data_ptr<H>(), y.data_ptr<H>())

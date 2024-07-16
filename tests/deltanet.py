@@ -334,7 +334,7 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     d_state = w.new_zeros(NH, D, D) # NHVK
     state_delta = w.new_zeros(NH, D, D) # NHVK # can this be float32?
 
-    tt = k.new_zeros(NH, chunk_size, C)
+    qk = k.new_zeros(NH, chunk_size, C)
     tk = k.new_zeros(NH, chunk_size, D)
 
     # materialize the state for the leading chunk
@@ -361,16 +361,16 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
         d_y_delta_c = -d_y_delta_c # neg
 
         # d_q, d_k
-        tt = einsum('nsv,ntv->nst', d_y_delta_c, tk)
-        tt.tril_()
+        qk = einsum('nsv,ntv->nst', d_y_delta_c, tk)
+        qk.tril_()
 
         # d_q
-        tk = einsum('nst,ntk->nsk', tt, k_[:, c]) # causal_attend_backward for delta
+        tk = einsum('nst,ntk->nsk', qk, k_[:, c]) # causal_attend_backward for delta
         tk.sub_(einsum('nsv,nvk->nsk', d_y_delta_c, state)) # prev_output
         d_q_[:, c] = tk
 
         # d_k
-        tk = einsum('nst,nsk->ntk', tt, q_[:, c])
+        tk = einsum('nst,nsk->ntk', qk, q_[:, c])
         if c < C-1:
             tk.add_(einsum('nvk,ntv->ntk', d_state, u[:, c])) # state_add
         else:
@@ -386,9 +386,9 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
             pass
 
         # d_state_decays
-        tt = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
-        tt.tril_()
-        d_state_decays = einsum('nsv,nst->ntv', d_y_delta_c, tt)
+        qk = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
+        qk.tril_()
+        d_state_decays = einsum('nsv,nst->ntv', d_y_delta_c, qk)
         if c < C-1:
             d_state_decays.sub_(einsum('nvk,ntk->ntv', d_state, k_[:, c])) # state_add
 

@@ -64,7 +64,7 @@ def test_decay_values_backward_cu():
 
 
 def test_forward_cu():
-    NH, T, D = 1, 32, 16
+    NH, T, D = 1, 64, 16
 
     chunk_size = 16
     C = T // chunk_size
