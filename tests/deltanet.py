@@ -36,7 +36,7 @@ from torch import einsum, randn, allclose, stack, eye, manual_seed, no_grad, set
 
 def tileprint(K, name='K'):
     "format matches tileprint in tk code so you can diff it"
-    assert K.shape == (16, 16)
+    assert K.shape == (16, 16), f'K shape is {K.shape}'
     for laneid in range(32):
         row_top = laneid // 4
         row_bottom = row_top + 8

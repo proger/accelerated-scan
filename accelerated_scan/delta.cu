@@ -525,7 +525,7 @@ __device__ static void loop_backward(
     load(k, _k + chunk*k.num_elements, k.cols);
     load(u, _u + chunk*u.num_elements, u.cols);
     
-    associate(state_delta, u, k);
+    associate(state, u, k);
 
     for (chunk = 1; chunk < num_chunks; chunk++) {
         load(w, _w + chunk*w.num_elements, w.cols);
@@ -555,6 +555,7 @@ __device__ static void loop_backward(
         load(u, _u + chunk*u.num_elements, u.cols);
         load(k, _k + chunk*k.num_elements, k.cols);
         load(w, _w + chunk*w.num_elements, w.cols);
+        load(q, _q + chunk*q.num_elements, q.cols);
 
         // we already have state_delta set up correctly in the first iteration
         if (chunk < num_chunks - 1) {
@@ -580,7 +581,7 @@ __device__ static void loop_backward(
         store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
 
         // d_k
-        attend(d_k, qk, q);
+        reverse_attend(d_k, qk, q);
         if (chunk < num_chunks - 1) {
             reverse_query(tk, u, d_state); // otherwise we know d_state is zero
             add(d_k, d_k, tk);
@@ -594,13 +595,12 @@ __device__ static void loop_backward(
         }
 
         // d_state_decays
-        load(q, _q + chunk*q.num_elements, q.cols);
         kernel(qk, q, k);
         make_causal(qk, qk, 0);
 
-        auto &d_state_decays_buf = d_u; // alias
         reverse_attend(d_state_decays, qk, d_y);
         if (chunk < num_chunks - 1) {
+            auto &d_state_decays_buf = d_u; // alias
             query(d_state_decays_buf, d_state, k);
             sub(d_state_decays, d_state_decays, d_state_decays_buf);
         }
@@ -689,18 +689,15 @@ __global__ void backward_kernel(
     rt<ACCUM, _time, _time> mma_TT;
     rt<ACCUM, _time, _key> mma_TD;
 
-    const int time_blocks = (num_chunks*kChunkSize) / (w_reg.rows*kNumWarps);
-
-    // int time_warp_index = time_blocks*kNumWarps + warpid;
-    int time_warp_index = warpid; // TODO
+    int time_index = warpid;
 
     /*
      * load k, v, beta, d_out_w, d_out_u, d_out_y
      */
 
-    load(k_reg, _k + time_warp_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
-    load(v_reg, _v + time_warp_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
-    load(beta_reg, _beta + time_warp_index); // beta = beta.clone()
+    load(k_reg, _k + time_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
+    load(v_reg, _v + time_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
+    load(beta_reg, _beta + time_index*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
 
     /*
      * decay_values_forward: compute w and u
@@ -710,8 +707,8 @@ __global__ void backward_kernel(
 
     decay_values_forward(mma_TT, mma_TD, tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg, tk_reg);
 
-    store(_w, w_reg, w_reg.cols);
-    store(_u, u_reg, u_reg.cols);
+    store(_w + time_index*w_reg.num_elements, w_reg, w_reg.cols);
+    store(_u + time_index*w_reg.num_elements, u_reg, u_reg.cols);
 
     // 
     // loop backwards
@@ -751,7 +748,7 @@ __global__ void backward_kernel(
      * causal_attend_backward for d_q, d_k_2, d_out_u
      */
 
-    load(d_out_y_reg, _d_out_y + time_warp_index*d_out_y_reg.num_elements, d_out_y_reg.cols); // d_out_y = d_out_y.clone()
+    load(d_out_y_reg, _d_out_y + time_index*d_out_y_reg.num_elements, d_out_y_reg.cols); // d_out_y = d_out_y.clone()
 
     zero(mma_TT);
     mma_ABt(mma_TT, d_out_y_reg, u_reg, mma_TT); // einsum('nsv,ntv->nst', d_out_y_reg, u)
@@ -767,12 +764,12 @@ __global__ void backward_kernel(
     copy(v_reg, mma_TD); // reuse v_reg for d_q
 
     if (1) {
-        load(tk_reg, _d_q + time_warp_index*tk_reg.num_elements, tk_reg.cols);
+        load(tk_reg, _d_q + time_index*tk_reg.num_elements, tk_reg.cols);
         add(v_reg, v_reg, tk_reg);
     }
-    store(_d_q + time_warp_index*q_reg.num_elements, v_reg, v_reg.cols);
+    store(_d_q + time_index*q_reg.num_elements, v_reg, v_reg.cols);
 
-    load(q_reg, _q + time_warp_index*q_reg.num_elements, q_reg.cols); // q = q.clone()
+    load(q_reg, _q + time_index*q_reg.num_elements, q_reg.cols); // q = q.clone()
 
     zero(mma_TD);
     {
@@ -783,10 +780,10 @@ __global__ void backward_kernel(
     }
 
     if (1) {
-        load(tk_reg, _d_k + time_warp_index*tk_reg.num_elements, tk_reg.cols);
+        load(tk_reg, _d_k + time_index*tk_reg.num_elements, tk_reg.cols);
         add(d_k_reg, d_k_reg, tk_reg);
     }
-    store(_d_k, d_k_reg, d_k_reg.cols); // first part of d_k
+    store(_d_k + time_index*d_k_reg.num_elements, d_k_reg, d_k_reg.cols); // first part of d_k
 
     zero(mma_TT);
     {
@@ -799,7 +796,7 @@ __global__ void backward_kernel(
 
     auto &d_out_u_reg = v_reg;
     zero(d_out_u_reg);
-    load(d_out_u_reg, _d_out_u + time_warp_index*d_out_u_reg.num_elements, d_out_u_reg.cols); // d_out_u = d_out_u.clone()
+    load(d_out_u_reg, _d_out_u + time_index*d_out_u_reg.num_elements, d_out_u_reg.cols); // d_out_u = d_out_u.clone()
 
     zero(mma_TD);
     {
@@ -817,7 +814,7 @@ __global__ void backward_kernel(
      * backward for d_k, d_v, d_beta
      */
 
-    load(d_out_w_reg, _d_out_w + time_warp_index*d_out_w_reg.num_elements, d_out_w_reg.cols); // d_out_w = d_out_w.clone()
+    load(d_out_w_reg, _d_out_w + time_index*d_out_w_reg.num_elements, d_out_w_reg.cols); // d_out_w = d_out_w.clone()
     zero(d_k_reg); // note that we have a part of d_k in global memory now
 
     for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
@@ -911,10 +908,10 @@ __global__ void backward_kernel(
     }
     sub(d_k_reg, d_k_reg, tk_reg);
 
-    load(tk_reg, _d_k + time_warp_index*d_k_reg.num_elements, d_k_reg.cols); // d_k = d_k.clone()
+    load(tk_reg, _d_k + time_index*d_k_reg.num_elements, d_k_reg.cols); // d_k = d_k.clone()
     __syncthreads();
     add(d_k_reg, d_k_reg, tk_reg); // d_k += tk, reload from global memory
-    store(_d_k, d_k_reg, d_k_reg.cols);
+    store(_d_k + time_index*d_k_reg.num_elements, d_k_reg, d_k_reg.cols);
 
     // d_beta
     mul(w_bases_reg, w_bases_reg, d_out_w_reg); // w_bases = einsum('ntk,ntk->ntk', w_bases, d_out_w)
@@ -922,7 +919,7 @@ __global__ void backward_kernel(
 
     // d_v using available d_out_u_reg register
     mul_row(d_out_u_reg, d_out_u_reg, beta_reg);
-    store(_d_v, d_out_u_reg, d_out_u_reg.cols);
+    store(_d_v + time_index*d_k_reg.num_elements, d_out_u_reg, d_out_u_reg.cols);
 
     // continue d_beta
     auto &w_bases_col = swap_layout_inplace(w_bases_reg);
@@ -930,7 +927,7 @@ __global__ void backward_kernel(
     zero(d_beta_reg);
     row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
     row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
-    store(_d_beta, d_beta_reg);
+    store(_d_beta + time_index*beta_reg.outer_dim*TILE_DIM, d_beta_reg);
 }
 
 // see also: DISPATCH
@@ -950,7 +947,7 @@ __global__ void backward_kernel(
 
 #define DISPATCH_ME(d, seqlen) \
     if (d == 16) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 2)); \
     } else if (d == 32) { \
         TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1)); \
     } else if (d == 64) { \

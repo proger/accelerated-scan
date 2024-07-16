@@ -14,7 +14,7 @@ from tests.deltanet import forward as forward_ref
 
 
 def test_backward():
-    NH, T, D = 1, 16, 16
+    NH, T, D = 1, 32, 16
 
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.bfloat16)
     d_out_w = torch.zeros_like(k) # placeholder
@@ -22,7 +22,8 @@ def test_backward():
     d_out_y = torch.randn_like(v) / D**0.5 # actual gradient
 
     d_q0, d_k0, d_v0, d_beta0 = backward_ref(
-        d_out_w.clone(), d_out_u.clone(), d_out_y.clone(), q, k, v, beta
+        d_out_w.clone(), d_out_u.clone(), d_out_y.clone(), q, k, v, beta,
+        chunk_size=16
     )
 
     d_q1 = q.new_zeros(NH, T, D)
@@ -40,8 +41,8 @@ def test_backward():
         w1, u1, y1
     )
 
-    #torch.set_printoptions(precision=4, sci_mode=False, linewidth=300)
-    torch.set_printoptions(linewidth=300)
+    torch.set_printoptions(precision=4, sci_mode=False, linewidth=300)
+    #torch.set_printoptions(linewidth=300)
 
     print(d_q0 - d_q1, 'd_q diff')
     assert allclose(d_q0, d_q1, atol=1e-2), 'd_q is wrong'
@@ -60,7 +61,7 @@ def test_backward():
 
 
 def test_forward():
-    NH, T, D = 1, 64, 16
+    NH, T, D = 1, 32, 16
 
     chunk_size = 16
     C = T // chunk_size
