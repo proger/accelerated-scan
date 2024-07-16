@@ -58,8 +58,13 @@ def tileprint(K, name='K'):
         ]))
 
 
-def decay_values(q_, k_, v_, beta_):
-    chunk_size = k_.size(1)
+def decay_values(q, k, v, beta, chunk_size=2):
+    NH, T, D = shape(q, k, v, beta)
+    C = T // chunk_size
+    q_, k_, v_, beta_ = (
+        q.view(NH*C, chunk_size, D), k.view(NH*C, chunk_size, D),
+        v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
+    )
 
     # evaluate all chunks in parallel
     beta__ = beta_.unsqueeze(-1)
@@ -83,12 +88,8 @@ def forward(q, k, v, beta, chunk_size=2):
     "decay values applying deltanet forgetting rules, then stitch chunks"
     NH, T, D = shape(q, k, v, beta)
     C = T // chunk_size
-    q_, k_, v_, beta_ = (
-        q.view(NH*C, chunk_size, D), k.view(NH*C, chunk_size, D),
-        v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
-    )
 
-    w, u, y = decay_values(q_, k_, v_, beta_)
+    w, u, y = decay_values(q, k, v, beta, chunk_size=chunk_size)
 
     # stitch chunks sequentially
     q_ = q.view(NH, C, chunk_size, D)
@@ -184,8 +185,15 @@ def make_example(NH, T, D, device='cpu', dtype=torch.float32):
 
 
 @no_grad()
-def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
-    NH, T, D = shape(q, k, v, beta)
+def backward(d_out_w_long, d_out_u_long, d_out_y_long, q_long, k_long, v_long, beta_long, chunk_size=2):
+    NH, T, D = shape(q_long, k_long, v_long, beta_long)
+
+    C = T // chunk_size
+    q, k, v, beta, d_out_y = (
+        q_long.view(NH*C, chunk_size, D), k_long.view(NH*C, chunk_size, D),
+        v_long.view(NH*C, chunk_size, D), beta_long.view(NH*C, chunk_size),
+        d_out_y_long.view(NH*C, chunk_size, D)
+    )
 
     #
     # allocations
@@ -196,21 +204,21 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
     k = k.clone() # load k
     v = v.clone() # load v
     beta = beta.clone() # load beta
-    d_out_w = d_out_w.clone() # ntk
-    d_out_y = d_out_y.clone() # ntv
+    #d_out_w = d_out_w.clone() # ntk # placeholders
+    #d_out_y = d_out_y.clone() # ntv # placeholders
 
-    w = k.new_zeros(NH, T, D) # ntk
-    u = v.new_zeros(NH, T, D) # ntw
+    w = k.new_zeros(NH*C, chunk_size, D) # ntk
+    u = v.new_zeros(NH*C, chunk_size, D) # ntw
     w_bases = w.clone() # ntk
     u_bases = u.clone() # ntw
 
     bk = einsum('nt,ntk->ntk', beta, k)
 
-    bKl = k.new_zeros(NH, T, T)
-    tt = k.new_zeros(NH, T, T)
+    bKl = k.new_zeros(NH*C, chunk_size, chunk_size)
+    tt = k.new_zeros(NH*C, chunk_size, chunk_size)
 
-    d_k = k.new_zeros(NH, T, D) # nsk
-    tk = k.new_zeros(NH, T, D) # ntk
+    d_k = k.new_zeros(NH*C, chunk_size, D) # nsk
+    tk = k.new_zeros(NH*C, chunk_size, D) # ntk
 
     #
     # forward
@@ -223,7 +231,7 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
     u_bases = v
     v = einsum('nt,ntw->ntw', beta, v)
 
-    for t in range(T):
+    for t in range(chunk_size):
         tk = einsum('nts,nsk->ntk', bKl, w) # matmul for the sake of one row
         w[:, t] = bk[:, t, :] - tk[:, t, :]
         tk = einsum('nts,nsw->ntw', bKl, u) # matmul for the sake of one row
@@ -231,6 +239,17 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
 
     w.clone() # store w
     u.clone() # store u
+
+    #
+    # stitch_backward
+    #
+    w_long = w.view(NH, T, D)
+    u_long = u.view(NH, T, D)
+    d_q_1_long, d_k_1_long, d_out_w_long, d_out_u_long = stitch_backward(d_out_y_long, q_long, k_long, w_long, u_long, C, chunk_size)
+
+    d_out_w, d_out_u = (
+        d_out_w_long.view(NH*C, chunk_size, D), d_out_u_long.view(NH*C, chunk_size, D)
+    )
 
     w_bases = einsum('nts,nsk->ntk', tt, w)
     w_bases = k - w_bases
@@ -262,7 +281,7 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
 
     d_k.zero_()
 
-    for t in range(T-1,-1,-1):
+    for t in range(chunk_size-1,-1,-1):
         # d_k
         tt = einsum('njw,ntw->njt', w, d_out_w) # matmul for the sake of one column t
         tt[:, t:, :] = 0
@@ -309,7 +328,12 @@ def decay_values_backward(d_out_w, d_out_u, d_out_y, q, k, v, beta):
     beta += einsum('ntv->nt', u_bases)
     d_beta = beta.clone() # store
 
-    return d_q, d_k, d_v, d_beta
+    d_q_long = d_q.view(NH, T, D) + d_q_1_long
+    d_k_long = d_k.view(NH, T, D) + d_k_1_long
+    d_v_long = d_v.view(NH, T, D)
+    d_beta_long = d_beta.view(NH, T)
+
+    return d_q_long, d_k_long, d_v_long, d_beta_long
 
 
 def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
@@ -408,61 +432,39 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     return d_q_.view(NH, T, D), d_k_.view(NH, T, D), d_w.view(NH, T, D), d_u.view(NH, T, D)
 
 
-class DeltaChunkwise(torch.autograd.Function):
+class Delta(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, beta, chunk_size):
         w, u, y = forward(q, k, v, beta, chunk_size)
-        ctx.save_for_backward(q, k, v, beta, w, u)
+        ctx.save_for_backward(q, k, v, beta)
         ctx.chunk_size = chunk_size
         return y
 
     @staticmethod
     def backward(ctx, d_y):
-        q, k, v, beta, w, u = ctx.saved_tensors
+        q, k, v, beta = ctx.saved_tensors
         NH, T, D = shape(q, k, v, beta)
-        chunk_size = ctx.chunk_size
-        C = T // chunk_size
+        d_w = k.new_zeros(NH, T, D)
+        d_u = v.new_zeros(NH, T, D)
 
-        q_, k_, v_, beta_ = (
-            q.view(NH*C, chunk_size, D), k.view(NH*C, chunk_size, D),
-            v.view(NH*C, chunk_size, D), beta.view(NH*C, chunk_size)
-        )
-
-        d_q_1, d_k_1, d_w, d_u = stitch_backward(d_y, q, k, w, u, C=C, chunk_size=chunk_size)
-
-        d_w = d_w.view(NH*C, chunk_size, D)
-        d_u = d_u.view(NH*C, chunk_size, D)
-        d_y = d_y.view(NH*C, chunk_size, D)
-        u = u.view(NH*C, chunk_size, D)
-
-        d_q_2, d_k_2, d_v_, d_beta_ = decay_values_backward(d_w, d_u, d_y, q_, k_, v_, beta_)
-
-        d_q_1 = d_q_1.view(NH, T, D)
-        d_q_2 = d_q_2.view(NH, C, chunk_size, D)
-        d_q_2 = d_q_2.reshape(NH, T, D)
-        d_q = d_q_1 + d_q_2
-
-        d_k_2 = d_k_2.reshape(NH, T, D)
-        d_k = d_k_1 + d_k_2
-        d_v = d_v_.reshape(NH, T, D)
-        d_beta = d_beta_.view(NH, T)
-
+        d_q, d_k, d_v, d_beta = backward(d_w, d_u, d_y, q, k, v, beta, chunk_size=ctx.chunk_size)
         return d_q, d_k, d_v, d_beta, None
 
 
-def test_delta_chunkwise_backward():
-    NH, T, D = 2, 16, 3
+def test_delta():
+    NH, T, D = 1, 64, 16
     q1, k1, v1, beta1 = make_example(NH, T, D)
 
     y0 = forward_loop(q1, k1, v1, beta1)
+    chunk_size = 8
     
-    w1, u1, y1 = forward(q1, k1, v1, beta1, chunk_size=2)
+    w1, u1, y1 = forward(q1, k1, v1, beta1, chunk_size=chunk_size)
     (y1 - torch.ones_like(y1).detach()).pow(2).mean().backward()
 
     assert allclose(y0, y1, atol=1e-5), 'y1 is wrong'
 
     q, k, v, beta = make_example(NH, T, D)
-    y = DeltaChunkwise.apply(q, k, v, beta, 2)
+    y = Delta.apply(q, k, v, beta, chunk_size)
     (y - torch.ones_like(y).detach()).pow(2).mean().backward()
 
     assert allclose(y1, y, atol=1e-5), 'y is wrong'
@@ -478,4 +480,5 @@ def test_delta_chunkwise_backward():
     assert allclose(v1.grad, v.grad, atol=1e-5), 'v.grad is wrong'
 
 
-test_delta_chunkwise_backward()
+if __name__ == '__main__':
+    test_delta()

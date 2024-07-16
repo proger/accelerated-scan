@@ -397,11 +397,11 @@ __device__ static void loop(
 /**
  * @brief Bind a list of vectors (k,u) and write them to a dictionary state_delta.
  */
-template <typename D, typename ACCUM, int _time, int _key, int _value>
+template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
 __device__ static void associate(
     rt<D, _value, _key, ducks::rt_layout::row> &state_delta,
-    const rt<D, _time, _value, ducks::rt_layout::row> &v,
-    const rt<D, _time, _key, ducks::rt_layout::row> &k
+    /*const*/ rt<D, _time, _value, ducks::rt_layout::row> &v,
+    /*const*/ rt<D, _time, _key, ducks::rt_layout::row> &k
 ) {
     rt<ACCUM, _value, _key> mma_state;
 
@@ -414,7 +414,7 @@ __device__ static void associate(
     copy(state_delta, mma_state);
 }
 
-template <typename D, typename ACCUM, int _time, int _key, int _value>
+template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
 __device__ static void query(
     rt<D, _time, _value, ducks::rt_layout::row> &output_values,
     const rt<D, _value, _key, ducks::rt_layout::row> &state,
@@ -427,11 +427,11 @@ __device__ static void query(
     copy(output_values, mma);
 }
 
-template <typename D, typename ACCUM, int _time, int _key, int _value>
+template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
 __device__ static void reverse_query(
     rt<D, _time, _key, ducks::rt_layout::row> &output_keys,
     const rt<D, _time, _value, ducks::rt_layout::row> &value_query,
-    const rt<D, _value, _key, ducks::rt_layout::row> &state
+    /*const*/ rt<D, _value, _key, ducks::rt_layout::row> &state
 ) {
     rt<ACCUM, _time, _key> mma;
 
@@ -443,7 +443,7 @@ __device__ static void reverse_query(
 }
 
 
-template <typename D, typename ACCUM, int _time_source, int _time_target, int _key>
+template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _key>
 __device__ static void kernel(
     rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
     const rt<D, _time_source, _key, ducks::rt_layout::row> &query,
@@ -456,11 +456,11 @@ __device__ static void kernel(
     copy(attention, qk);
 }
 
-template <typename D, typename ACCUM, int _time_source, int _time_target, int _value>
+template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
 __device__ static void attend(
     rt<D, _time_source, _value, ducks::rt_layout::row> &mixtures,
     const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    const rt<D, _time_target, _value, ducks::rt_layout::row> &values
+    /*const*/ rt<D, _time_target, _value, ducks::rt_layout::row> &values
 ) {
     rt<ACCUM, _time_source, _value> mma;
 
@@ -471,18 +471,18 @@ __device__ static void attend(
     swap_layout_inplace(values_col);
 }
 
-template <typename D, typename ACCUM, int _time_source, int _time_target, int _value>
+template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
 __device__ static void reverse_attend(
     rt<D, _time_target, _value, ducks::rt_layout::row> &mixtures,
-    const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    const rt<D, _time_source, _value, ducks::rt_layout::row> &source_values
+    /*const*/ rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
+    /*const*/ rt<D, _time_source, _value, ducks::rt_layout::row> &source_values
 ) {
     rt<ACCUM, _time_target, _value> mma;
 
     zero(mma);
     auto &attention_col = swap_layout_inplace(attention);
     auto &source_values_col = swap_layout_inplace(source_values);
-    mma_AtB(mma, attention, source_values_col, mma);
+    mma_AtB(mma, attention_col, source_values_col, mma);
     copy(mixtures, mma);
     swap_layout_inplace(attention_col);
     swap_layout_inplace(source_values_col);
@@ -497,12 +497,12 @@ __device__ static inline void negate(T &dst) {
     unary_map<op_negate, T>(dst, dst);
 }
 
-template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kChunkSize>
+template <typename T, typename D, typename ACCUM = float2, int _time, int _key, int _value>
 __device__ static void loop_backward(
     const T *_d_y,
     const T *_q,
     const T *_k,
-    const T *_w,
+    T *_w, // actually const
     T *_u, // will be updated
     T *_d_q,
     T *_d_k,
@@ -513,7 +513,6 @@ __device__ static void loop_backward(
     rt<D, _value, _key> state, d_state, state_delta;
     rt<D, _time, _time> qk;
     rt<D, _time, _key> tk, q, k, w;
-    rt<ACCUM, _time, _key> mma_tk;
     rt<D, _time, _value> d_y, u, d_u, d_state_decays;
     rt<D, _time, _key> d_q, d_k;
 
@@ -599,7 +598,7 @@ __device__ static void loop_backward(
         kernel(qk, q, k);
         make_causal(qk, qk, 0);
 
-        auto &d_state_decays_buf = &d_u; // alias
+        auto &d_state_decays_buf = d_u; // alias
         reverse_attend(d_state_decays, qk, d_y);
         if (chunk < num_chunks - 1) {
             query(d_state_decays_buf, d_state, k);
@@ -631,10 +630,10 @@ __device__ static void loop_backward(
 
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
-__global__ void decay_values_backward_kernel(
+__global__ void backward_kernel(
     int num_chunks,
-    const H* __restrict__ __d_out_w__,
-    const H* __restrict__ __d_out_u__,
+    H* __restrict__ __d_out_w__,
+    H* __restrict__ __d_out_u__,
     const H* __restrict__ __d_out_y__,
     const H* __restrict__ __q__,
     const H* __restrict__ __k__,
@@ -651,14 +650,14 @@ __global__ void decay_values_backward_kernel(
     auto warpid           = kittens::warpid();
     auto block_start      = blockIdx.x*(num_chunks*kChunkSize*(_key*TILE_DIM));
     auto beta_block_start = blockIdx.x*(num_chunks*kChunkSize*1); // width is 1 for beta
-    const T *_d_out_w = reinterpret_cast<const T *>(__d_out_w__) + block_start,
-            *_d_out_u = reinterpret_cast<const T *>(__d_out_u__) + block_start,
-            *_d_out_y = reinterpret_cast<const T *>(__d_out_y__) + block_start,
+    const T *_d_out_y = reinterpret_cast<const T *>(__d_out_y__) + block_start,
             *_q = reinterpret_cast<const T *>(__q__) + block_start,
             *_k = reinterpret_cast<const T *>(__k__) + block_start,
             *_v = reinterpret_cast<const T *>(__v__) + block_start,
             *_beta = reinterpret_cast<const T *>(__beta__) + beta_block_start;
-          T *_d_q = reinterpret_cast<T *>(__d_q__) + block_start,
+          T *_d_out_w = reinterpret_cast<T *>(__d_out_w__) + block_start,
+            *_d_out_u = reinterpret_cast<T *>(__d_out_u__) + block_start,
+            *_d_q = reinterpret_cast<T *>(__d_q__) + block_start,
             *_d_k = reinterpret_cast<T *>(__d_k__) + block_start,
             *_d_v = reinterpret_cast<T *>(__d_v__) + block_start,
             *_d_beta = reinterpret_cast<T *>(__d_beta__) + beta_block_start,
@@ -702,7 +701,6 @@ __global__ void decay_values_backward_kernel(
     load(k_reg, _k + time_warp_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
     load(v_reg, _v + time_warp_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
     load(beta_reg, _beta + time_warp_index); // beta = beta.clone()
-    load(d_out_w_reg, _d_out_w + time_warp_index*d_out_w_reg.num_elements, d_out_w_reg.cols); // d_out_w = d_out_w.clone()
 
     /*
      * decay_values_forward: compute w and u
@@ -714,6 +712,22 @@ __global__ void decay_values_backward_kernel(
 
     store(_w, w_reg, w_reg.cols);
     store(_u, u_reg, u_reg.cols);
+
+    // 
+    // loop backwards
+    //
+    if (1) {
+        __syncthreads();
+        if (warpid == 0) {
+            loop_backward<T, D, ACCUM, _time, _key, _value>(
+                _d_out_y,
+                _q, _k, _w, _u,
+                _d_q, _d_k, _d_out_w, _d_out_u,
+                num_chunks
+            );
+        }
+        __syncthreads();
+    }
 
     {
         zero(mma_TD);
@@ -751,7 +765,12 @@ __global__ void decay_values_backward_kernel(
         k_reg = swap_layout_inplace(k_reg_col);
     }
     copy(v_reg, mma_TD); // reuse v_reg for d_q
-    store(_d_q, v_reg, v_reg.cols);
+
+    if (1) {
+        load(tk_reg, _d_q + time_warp_index*tk_reg.num_elements, tk_reg.cols);
+        add(v_reg, v_reg, tk_reg);
+    }
+    store(_d_q + time_warp_index*q_reg.num_elements, v_reg, v_reg.cols);
 
     load(q_reg, _q + time_warp_index*q_reg.num_elements, q_reg.cols); // q = q.clone()
 
@@ -761,6 +780,11 @@ __global__ void decay_values_backward_kernel(
         mma_AtB(mma_TD, tt_reg_col, q_reg, mma_TD); // mma_TD = einsum('nst,nsk->ntk', tt, q)
         copy(d_k_reg, mma_TD);
         tt_reg = swap_layout_inplace(tt_reg_col);
+    }
+
+    if (1) {
+        load(tk_reg, _d_k + time_warp_index*tk_reg.num_elements, tk_reg.cols);
+        add(d_k_reg, d_k_reg, tk_reg);
     }
     store(_d_k, d_k_reg, d_k_reg.cols); // first part of d_k
 
@@ -793,6 +817,7 @@ __global__ void decay_values_backward_kernel(
      * backward for d_k, d_v, d_beta
      */
 
+    load(d_out_w_reg, _d_out_w + time_warp_index*d_out_w_reg.num_elements, d_out_w_reg.cols); // d_out_w = d_out_w.clone()
     zero(d_k_reg); // note that we have a part of d_k in global memory now
 
     for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
@@ -937,7 +962,10 @@ __global__ void decay_values_backward_kernel(
     }
 
 void
-forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta, torch::Tensor w, torch::Tensor u, torch::Tensor y) {
+forward(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
+    torch::Tensor w, torch::Tensor u, torch::Tensor y
+) {
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
@@ -986,11 +1014,14 @@ forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta, t
 #undef DELTA_DISPATCH
 }
 
+
 void
-decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tensor d_out_y,
-                      torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
-                      torch::Tensor d_q, torch::Tensor d_k, torch::Tensor d_v, torch::Tensor d_beta,
-                      torch::Tensor w, torch::Tensor u, torch::Tensor y) {
+backward(
+    torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tensor d_out_y,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
+    torch::Tensor d_q, torch::Tensor d_k, torch::Tensor d_v, torch::Tensor d_beta,
+    torch::Tensor w, torch::Tensor u, torch::Tensor y
+) {
     CHECK_INPUT(d_out_w);
     CHECK_INPUT(d_out_u);
     CHECK_INPUT(d_out_y);
@@ -1041,8 +1072,8 @@ decay_values_backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tenso
         unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
-        CHECK_CUDA_ERROR(cudaFuncSetAttribute(decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        decay_values_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
+        CHECK_CUDA_ERROR(cudaFuncSetAttribute(backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
+        backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
             (int)num_chunks, \
             d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(), d_out_y.data_ptr<H>(), \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
