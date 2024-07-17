@@ -16,7 +16,7 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         x_names=["SEQUENCE_LENGTH"],  # argument names to use as an x-axis for the plot
         #x_vals=[2**i for i in range(7, max_exponent)],
         #x_vals=[512,1024,2048,4096,8192,16384],
-        x_vals=[128,256],
+        x_vals=[128,256,512],
         #x_vals=[512,1024,2048,4096,8192,16384],
         xlabel='sequence length',
         ylabel='ms',
@@ -27,8 +27,8 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         #line_vals=["triton", "ref", "warp"],
         #line_names=["flash", "kittenexp", "warp"],
         #line_vals=["flash", "kittenexp", "warp"],
-        line_names=["linear-kitten", "flash2"],
-        line_vals=["kitten", "flash"],
+        line_names=["linear-kitten", "flash2", "delta"],
+        line_vals=["kitten", "flash", "delta"],
         plot_name=plot_name,
         args={
             "direction": direction,
@@ -124,6 +124,31 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
             match direction:
                 case "forward":
                     scan = lambda: scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        case "delta":
+            print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
+            from accelerated_scan.kitten import delta_forward
+
+            gates, tokens = init(B, H, T, device=device, requires_grad=direction=="train")
+
+            k = tokens.unsqueeze(-1).expand(B, H, T, D).bfloat16().contiguous()
+            q = torch.ones_like(k).bfloat16().contiguous()
+            v = torch.ones_like(q).bfloat16().contiguous()
+            f = gates.bfloat16().contiguous()
+            o = torch.empty_like(v).bfloat16().contiguous()
+
+            k = k.view(B*H, T, D)
+            q = q.view(B*H, T, D)
+            v = v.view(B*H, T, D)
+            f = f.view(B*H, T)
+            o = o.view(B*H, T, D)
+            w = k.new_zeros(B*H, T, D)
+            u = v.new_zeros(B*H, T, D)
+            
+            match direction:
+                case "forward":
+                    def scan():
+                        delta_forward(q, k, v, f, w, u, o)
         case _:
             raise ValueError(f"Unknown provider {provider}")
 
