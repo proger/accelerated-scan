@@ -13,8 +13,10 @@ from tests.deltanet import forward as forward_ref
 
 
 
-def test_backward():
-    NH, T, D = 1, 32, 16
+@pytest.mark.parametrize('T', [32, 64, 128, 256])
+@pytest.mark.parametrize('D', [16, 32, 64, 128])
+def test_backward(T, D):
+    NH, T, D = 1, T, D
 
     q, k, v, beta = make_example(NH, T, D, device='cuda', dtype=torch.bfloat16)
     d_out_w = torch.zeros_like(k) # placeholder
@@ -44,24 +46,25 @@ def test_backward():
     torch.set_printoptions(precision=4, sci_mode=False, linewidth=300)
     #torch.set_printoptions(linewidth=300)
 
-    print(d_q0 - d_q1, 'd_q diff')
+    #print(d_q0 - d_q1, 'd_q diff')
     assert allclose(d_q0, d_q1, atol=1e-2), 'd_q is wrong'
 
-    print(d_k0, 'd_k ref')
-    print(d_k1, 'd_k hyp')
+    #print(d_k0, 'd_k ref')
+    #print(d_k1, 'd_k hyp')
     #print((d_k1 - d_k0).abs().topk(10), 'd_k diff')
     assert allclose(d_k0, d_k1, atol=1e-2), 'd_k is wrong' # ???
     assert allclose(d_v0, d_v1, atol=1e-2), 'd_v is wrong'
 
-    print(d_beta0, 'ref')
-    print(d_beta1, 'hyp')
+    #print(d_beta0, 'ref')
+    #print(d_beta1, 'hyp')
     # XXX: atol=1e-2 might be too low. cast to float32?
     assert allclose(d_beta0, d_beta1, atol=1e-2), 'd_beta is wrong'
 
 
-
-def test_forward():
-    NH, T, D = 1, 32, 16
+@pytest.mark.parametrize('T', [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize('D', [16, 32, 64, 128])
+def test_forward(T, D):
+    NH, T, D = 1, T, D
 
     chunk_size = 16
     C = T // chunk_size
@@ -100,7 +103,14 @@ def test_forward():
     assert allclose(y, y2, atol=1e-2), 'y2 is wrong'
 
 
+@pytest.mark.parametrize('T', [2048, 4096, 8192, 16384])
+@pytest.mark.parametrize('D', [16, 32, 64, 128])
+def test_longf(T, D):
+    return test_forward(T, D)
+
+
 if __name__ == '__main__':
-    #pytest.main([__file__])
-    test_forward()
-    test_backward()
+    #pytest.main([__file__, "--disable-warnings", "-v"])
+    test_forward(T=128, D=32)
+    #test_backward()
+    #test_forward(T=32, D=16)
