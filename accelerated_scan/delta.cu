@@ -1,6 +1,9 @@
+#include <cooperative_groups.h>
+#include <cuda/barrier>
 #include "algebra.cu"
 
 using namespace kittens; // this kernel only handles headdim=q_reg.cols for simplicity. Also n should be a multiple of 256 here.
+using barrier = cuda::barrier<cuda::thread_scope_block>;
 
 template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
 static __device__ inline void decay_values_forward(
@@ -17,8 +20,6 @@ static __device__ inline void decay_values_forward(
     using col = rt<D, _time, _key, ducks::rt_layout::col>;
     rt<D, _time, _key> tk_reg;
 
-    __syncthreads();
-
     mul_row(bk_reg, k_reg, beta_reg); // k = einsum('ntk,nt->ntk', k, beta)
 
     kernel(tt_reg, k_reg, k_reg);
@@ -33,18 +34,12 @@ static __device__ inline void decay_values_forward(
     mul_row(v_reg, v_reg, beta_reg); // v = einsum('ntw,nt->ntw', v, beta)
 
     for (auto t = 0; t < w_reg.rows; t++) {
-        __syncthreads();
-
         reverse_query(tk_reg, bKl_reg, w_reg);
         op_singlerow<base_ops::sub>(w_reg, bk_reg, tk_reg, t); // w[t] = bk[t] - tk[t]
-
-        __syncthreads();
     
         reverse_query(tk_reg, bKl_reg, u_reg);
         op_singlerow<base_ops::sub>(u_reg, v_reg, tk_reg, t); // u[t] = bv[t] - tk[t]
     }
-
-    __syncthreads();
 }
 
 
@@ -86,6 +81,17 @@ __global__ void delta_forward_kernel(
     typename rt<D, _time, _key>::col_vec beta_reg;
     rt<D, _time, _time> qk;
 
+    __shared__ barrier batons[kNumWarps];
+    auto block = cooperative_groups::this_thread_block();
+
+    if (block.thread_rank() == 0) {
+        for (int i = 0; i < kNumWarps; i++) {
+            init(&batons[i], 2);
+        }
+        batons[0].arrive();
+    }
+    block.sync();
+
     for (int time_block = 0; time_block < (num_chunks + kNumWarps - 1) / kNumWarps; time_block++) {
         int chunk = time_block * kNumWarps + warpid;
         if (chunk >= num_chunks) {
@@ -93,8 +99,8 @@ __global__ void delta_forward_kernel(
         }
 
         /*
-        * load k, v, beta
-        */
+         * load k, v, beta
+         */
 
         load(k, _k + chunk*k.num_elements, k.cols); // k = k.clone()
         load(v, _v + chunk*v.num_elements, v.cols); // v = v.clone()
@@ -119,13 +125,13 @@ __global__ void delta_forward_kernel(
         auto &y = v;
         attend(y, qk, u);
 
-        loop(shared_state, mma_state, q, k, w, u, y, kNumWarps, time_block);
+        loop(shared_state, mma_state, q, k, w, u, y, chunk, batons);
 
         store(_y + chunk*y.num_elements, y, y.cols);
     }
 }
 
-template <typename T, typename D, typename ACCUM, int _time, int _key, int _value>
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps>
 __device__ static inline void loop(
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
     rt<ACCUM, _value, _key> &mma_state,
@@ -134,50 +140,54 @@ __device__ static inline void loop(
     rt<D, _time, _key> &w, // will be repurposed
     rt<D, _time, _value> &u, // will be repurposed
     rt<D, _time, _value> &y,
-    const int kNumWarps,
-    const int time_block
+    const int chunk,
+    barrier (&batons)[kNumWarps]
 ) {
     auto warpid = kittens::warpid();
+    auto laneid = kittens::laneid();
 
     rt<D, _value, _key> state;
     rt<D, _time, _value> u_old;
     rt<D, _time, _time> qk;
 
-    __syncthreads();
-
     // all warps execute sequentially, passing state through the shared memory
-    for (int warp = 0; warp < kNumWarps; warp++) {
-        if (warp == warpid) {
-            int chunk = time_block * kNumWarps + warpid;
-
-            if (time_block > 0 || chunk > 0) {
-                load(state, shared_state);
-                copy(mma_state, state);
-
-                query(u_old, state, w);
-
-                kernel(qk, q, k);
-                make_causal(qk, qk, 0);
-
-                auto &y_prev = w; // repurpose w
-                attend(y_prev, qk, u_old);
-                sub(y, y, y_prev);
-
-                auto &y_cur = w; // repurpose w again
-                query(y_cur, state, q);
-                add(y, y, y_cur);
-
-                sub(u, u, u_old);
-            } else {
-                zero(mma_state);
-            }
-
-            associate(state, u, k, mma_state, true);
-            store(shared_state, state);
-        }
-
-        __syncthreads();
+    if (laneid == 0) {
+        // wait until our state is ready
+        barrier::arrival_token token = batons[warpid].arrive();
+        batons[warpid].wait(std::move(token));
     }
+    __syncwarp();
+
+    if (chunk > 0) {
+        load(state, shared_state);
+        copy(mma_state, state);
+
+        query(u_old, state, w);
+
+        kernel(qk, q, k);
+        make_causal(qk, qk, 0);
+
+        auto &y_prev = w; // repurpose w
+        attend(y_prev, qk, u_old);
+        sub(y, y, y_prev);
+
+        auto &y_cur = w; // repurpose w again
+        query(y_cur, state, q);
+        add(y, y, y_cur);
+
+        sub(u, u, u_old);
+    } else {
+        zero(mma_state);
+    }
+
+    associate(state, u, k, mma_state, true);
+    store(shared_state, state);
+
+    if (laneid == 0) {
+        // data ƒor the next chunk has arrived
+        batons[(warpid + 1) % kNumWarps].arrive();
+    }
+    __syncwarp();
 }
 
 template <typename T, typename D, typename ACCUM = float2, int _time, int _key, int _value>
