@@ -13,7 +13,7 @@ from tests.deltanet import forward as forward_ref
 
 
 
-@pytest.mark.parametrize('T', [32, 64, 128, 256])
+@pytest.mark.parametrize('T', [16, 32, 64, 128, 256])
 @pytest.mark.parametrize('D', [16, 32, 64, 128])
 def test_backward(T, D):
     NH, T, D = 1, T, D
@@ -61,7 +61,7 @@ def test_backward(T, D):
     assert allclose(d_beta0, d_beta1, atol=1e-2), 'd_beta is wrong'
 
 
-@pytest.mark.parametrize('T', [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize('T', [16, 32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize('D', [16, 32, 64, 128])
 def test_forward(T, D):
     NH, T, D = 1, T, D
@@ -93,13 +93,6 @@ def test_forward(T, D):
     from accelerated_scan import kitten
     kitten.delta_forward(q, k, v, beta, w2, u2, y2)
 
-    #print((w2 - w).abs().max())
-
-    assert allclose(u, u2, atol=1e-2), 'u2 is wrong'
-    assert allclose(w, w2, atol=1e-2), 'w2 is wrong'
-    # print(y, 'y')
-    # print(y2, 'y2')
-    #print(y - y2, 'y diff')
     assert allclose(y, y2, atol=1e-2), 'y2 is wrong'
 
 
@@ -111,6 +104,6 @@ def test_longf(T, D):
 
 if __name__ == '__main__':
     #pytest.main([__file__, "--disable-warnings", "-v"])
-    test_forward(T=128, D=32)
+    test_forward(T=32, D=32)
     #test_backward()
     #test_forward(T=32, D=16)

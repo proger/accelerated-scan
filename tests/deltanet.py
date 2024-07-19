@@ -98,38 +98,32 @@ def forward(q, k, v, beta, chunk_size=2):
     w = w.view(NH, C, chunk_size, D)
     y = y.view(NH, C, chunk_size, D)
 
-    # materialize the state for the leading chunk
-
-    kc = k_[:, 0]
-    uc = u[:, 0]
-
     state = u.new_zeros(NH, D, D)
 
-    for c in range(1, C):
-        state = state + einsum('ntv,ntk->nvk', uc, kc)
-
-        wc = w[:, c] # load w
-        uc = einsum('ntk,nvk->ntv', wc, state) # DDT
-
+    for c in range(C):
         qc = q_[:, c] # load q
         kc = k_[:, c] # load k
+        wc = w[:, c] # load w
+        uc = u[:, c] # load u
+        yc = y[:, c] # load y
 
-        # attend to old values
-        qk = einsum("nsi,nti->nst", qc, kc) # TDT
-        qk = qk.tril()
+        if c:
+            u_old = einsum('ntk,nvk->ntv', wc, state) # DDT
 
-        yc = y[:, c].clone() # load y
+            # attend to old values
+            qk = einsum("nsi,nti->nst", qc, kc) # TDT
+            qk = qk.tril()
 
-        y_prev = einsum("nst,ntv->nsv", qk, uc) # TTD
-        yc = yc - y_prev
+            y_prev = einsum("nst,ntv->nsv", qk, u_old) # TTD
+            yc = yc - y_prev
 
-        y_cur = einsum('nsk,nvk->nsv', qc, state) # DDT
-        yc = yc + y_cur
+            y_cur = einsum('nsk,nvk->nsv', qc, state) # DDT
+            yc = yc + y_cur
 
+            uc = uc - u_old
+
+        state = state + einsum('ntv,ntk->nvk', uc, kc)
         y[:, c] = yc # store
-
-        u1 = u[:, c] # load u
-        uc = u1 - uc
 
     w = w.view(NH, T, D)
     u = u.view(NH, T, D)

@@ -1,175 +1,6 @@
-#include "tk/src/kittens.cuh"
-#include "tk/src/common/pyutils/torch_helpers.cuh"
+#include "algebra.cu"
 
 using namespace kittens; // this kernel only handles headdim=q_reg.cols for simplicity. Also n should be a multiple of 256 here.
-
-
-template <typename H = bf16, int _time, int _key>
-__device__ void tileprint(rt<H, _time, _key, ducks::rt_layout::row> reg, char *name) {
-    auto laneid = kittens::laneid();
-    static_assert(reg.height == 1 && reg.width == 1, "height and width must be 1");
-    for(int i = 0; i < reg.height; i++) {
-        for(int j = 0; j < reg.width; j++) {
-            static_assert(reg.packed_per_thread == 4, "packed_per_thread must be 4");
-
-            int row_top = laneid / 4;
-            int row_bottom = row_top + 8;
-            int col_left = laneid % 4 * 2; // stride 4
-            int col_right = col_left + 8;
-
-            auto item_top_left = __bfloat1622float2(reg.tiles[i][j].data[0]);
-            auto item_bottom_left = __bfloat1622float2(reg.tiles[i][j].data[1]);
-            auto item_top_right = __bfloat1622float2(reg.tiles[i][j].data[2]);
-            auto item_bottom_right = __bfloat1622float2(reg.tiles[i][j].data[3]);
-            printf("lane=%02d "
-                "%s[%02d,%02d] 0x=% .3f "
-                "%s[,%02d] 0y=% .3f    "
-                "%s[%02d,%02d] 1x=% .3f "
-                "%s[,%02d] 1y=% .3f    "
-                "%s[%02d,%02d] 2x=% .3f "
-                "%s[,%02d] 2y=% .3f    "
-                "%s[%02d,%02d] 3x=% .3f "
-                "%s[,%02d] 3y=% .3f\n",
-                laneid,
-                name, row_top, col_left, item_top_left.x,
-                name, col_left+1, item_top_left.y,
-                name, row_bottom, col_left, item_bottom_left.x,
-                name, col_left+1, item_bottom_left.y,
-                name, row_top, col_right, item_top_right.x,
-                name, col_right+1, item_top_right.y,
-                name, row_bottom, col_right, item_bottom_right.x,
-                name, col_right+1, item_bottom_right.y);
-        }
-    }
-}
-
-
-template<typename op, ducks::rt::all T>
-__device__ static inline void op_singlerow(T &dst, const T &lhs, const T &rhs, const int row_index) {
-    const int row_top = laneid() / 4;
-    const int row_bottom = row_top + 8;
-
-    static_assert(dst.packed_per_tile == 4, "packed_per_tile must be 4");
-    using dtype = T::dtype;
-
-    #pragma unroll
-    for(int i = 0; i < dst.height; i++) {
-        #pragma unroll
-        for(int j = 0; j < dst.width; j++) {            
-            if (row_top == row_index) {
-                dst.tiles[i][j].data[0] = op::template op<dtype>(lhs.tiles[i][j].data[0], rhs.tiles[i][j].data[0]);
-                dst.tiles[i][j].data[2] = op::template op<dtype>(lhs.tiles[i][j].data[2], rhs.tiles[i][j].data[2]);
-            } else if (row_bottom == row_index) {
-                dst.tiles[i][j].data[1] = op::template op<dtype>(lhs.tiles[i][j].data[1], rhs.tiles[i][j].data[1]);
-                dst.tiles[i][j].data[3] = op::template op<dtype>(lhs.tiles[i][j].data[3], rhs.tiles[i][j].data[3]);
-            }
-        }
-    }
-}
-
-
-template<ducks::rt::all RT>
-__device__ static inline void reset_trailing_rows(RT &dst, const int row_index, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    const int row_top = laneid() / 4;
-    const int row_bottom = row_top + 8;
-
-    static_assert(dst.packed_per_tile == 4, "packed_per_tile must be 4");
-
-    #pragma unroll
-    for(int i = 0; i < dst.height; i++) {
-        #pragma unroll
-        for(int j = 0; j < dst.width; j++) {            
-            if (row_top >= row_index) {
-                dst.tiles[i][j].data[0].x = val;
-                dst.tiles[i][j].data[0].y = val;
-                dst.tiles[i][j].data[2].x = val;
-                dst.tiles[i][j].data[2].y = val;
-            }
-            if (row_bottom >= row_index) {
-                dst.tiles[i][j].data[1].x = val;
-                dst.tiles[i][j].data[1].y = val;
-                dst.tiles[i][j].data[3].x = val;
-                dst.tiles[i][j].data[3].y = val;
-            }
-        }
-    }
-}
-
-
-
-/**
- * @brief Set a constant to elements of the diagonal in a square register tile.
- *
- * @tparam T The data type of the register tile elements.
- * @tparam _size The size (height and width) of the square register tile.
- * @tparam layout The current layout of the register tile.
- * @param tile[in,out] Reference to the register tile.
- */
-template<ducks::rt::row_layout RT>
-__device__ static inline void set_diagonal(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=1) {
-    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
-    #pragma unroll
-    for(int i = 0; i < dst.height; i++) {
-        #pragma unroll
-        for(int j = 0; j < dst.width; j++) {
-            if(j > i || j < i) { // below or above the diagonal, ignore
-                #pragma unroll
-                for(int k = 0; k < dst.packed_per_tile; k++) {
-                    dst.tiles[i][j].data[k] = src.tiles[i][j].data[k];
-                }
-            } else { // on the diagonal, interesting!
-                dst.tiles[i][j].data[1] = src.tiles[i][j].data[1]; // below diagonal, copy
-                dst.tiles[i][j].data[2] = src.tiles[i][j].data[2]; // above diagonal, copy
-
-                if (laneid() == 0 || laneid() == 9 || laneid() == 18 || laneid() == 27) {
-                    // diagonal: every odd row
-                    dst.tiles[i][j].data[0].x = val;
-                    dst.tiles[i][j].data[3].x = val;
-                } else {
-                    dst.tiles[i][j].data[0].x = src.tiles[i][j].data[0].x;
-                    dst.tiles[i][j].data[3].x = src.tiles[i][j].data[3].x;
-                }
-
-                if (laneid() == 4 || laneid() == 13 || laneid() == 22 || laneid() == 31) {
-                    // diagonal: every even row
-                    dst.tiles[i][j].data[0].y = val;
-                    dst.tiles[i][j].data[3].y = val;
-                } else {
-                    dst.tiles[i][j].data[0].y = src.tiles[i][j].data[0].y;
-                    dst.tiles[i][j].data[3].y = src.tiles[i][j].data[3].y;
-                }
-            }
-        }
-    }
-}
-
-
-__device__ void vecprint(rv<bf16_2, 1, 2> reg, char *name) {
-    auto warpid        = kittens::warpid();
-    auto item0 = __bfloat1622float2(reg.data[0][0]);
-    printf("warpid=%d tid=%d %s[0] = {%f,%f}\n", warpid, threadIdx.x, name, item0.x, item0.y);
-    auto item1 = __bfloat1622float2(reg.data[0][1]);
-    printf("warpid=%d tid=%d %s[1] = {%f,%f}\n", warpid, threadIdx.x, name, item1.x, item1.y);
-}
-
-__device__ void vecprint(rv<bf16_2, 1, 1> reg, char *name) {
-    auto warpid        = kittens::warpid();
-    auto item0 = __bfloat1622float2(reg.data[0][0]);
-    printf("warpid=%d tid=%d %s[0] = {%f,%f}\n", warpid, threadIdx.x, name, item0.x, item0.y);
-}
-
-__device__ void vecprint(rv<bf16_2, 8, 2> reg, char *name) {
-    auto warpid        = kittens::warpid();
-    
-    #pragma unroll
-    for(int i = 0; i < reg.outer_dim; i++) {
-        #pragma unroll
-        for(int j = 0; j < reg.inner_dim; j++) {
-            auto item = __bfloat1622float2(reg.data[i][j]);
-            printf("warpid=%d tid=%d %s[%d][%d] = {%f,%f}\n", warpid, threadIdx.x, name, i, j, item.x, item.y);
-        }
-    }
-}
 
 template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
 static __device__ inline void decay_values_forward(
@@ -218,7 +49,7 @@ static __device__ inline void decay_values_forward(
 
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 1, int kChunkSize = 16>
-__global__ void forward_kernel(
+__global__ void delta_forward_kernel(
     const int num_chunks,
     const H* __restrict__ __q__,
     const H* __restrict__ __k__,
@@ -238,19 +69,26 @@ __global__ void forward_kernel(
           T *_w = reinterpret_cast<T *>(__w__) + block_start,
             *_u = reinterpret_cast<T *>(__u__) + block_start,
             *_y = reinterpret_cast<T *>(__y__) + block_start;
+
+    extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
+    shared_allocator al((int*)&__shm[0]);
     
+    st<T, _value, _key, ducks::st_layout::swizzle> (&shared_states)[1] = al.allocate<st<T, _value, _key, ducks::st_layout::swizzle>, 1>();
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_state = shared_states[0];
+
     using col = rt<D, _time, _key, ducks::rt_layout::col>;
     /*
      * register allocations
      */
-    rt<D, _time, _key> k_reg, w_reg, bk_reg;
-    rt<D, _time, _value> v_reg, u_reg;
+    rt<ACCUM, _value, _key> mma_state;
+    rt<D, _time, _key> k, w, bk;
+    rt<D, _time, _value> v, u;
     typename rt<D, _time, _key>::col_vec beta_reg;
-    rt<D, _time, _time> tt_reg;
+    rt<D, _time, _time> qk;
 
     for (int time_block = 0; time_block < (num_chunks + kNumWarps - 1) / kNumWarps; time_block++) {
-        int time_index = time_block * kNumWarps + warpid;
-        if (time_index >= num_chunks) {
+        int chunk = time_block * kNumWarps + warpid;
+        if (chunk >= num_chunks) {
             break;
         }
 
@@ -258,232 +96,88 @@ __global__ void forward_kernel(
         * load k, v, beta
         */
 
-        load(k_reg, _k + time_index*k_reg.num_elements, k_reg.cols); // k = k.clone()
-        load(v_reg, _v + time_index*v_reg.num_elements, v_reg.cols); // v = v.clone()
-        load(beta_reg, _beta + time_index*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
+        load(k, _k + chunk*k.num_elements, k.cols); // k = k.clone()
+        load(v, _v + chunk*v.num_elements, v.cols); // v = v.clone()
+        load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
 
         /*
         * decay_values_forward: compute w and u
         */
 
-        decay_values_forward(tt_reg, tt_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, v_reg, bk_reg);
-
-        store(_w + time_index*u_reg.num_elements, w_reg, w_reg.cols);
-        store(_u + time_index*u_reg.num_elements, u_reg, u_reg.cols);
+        decay_values_forward(qk, qk, k, beta_reg, w, u, v, v, bk);
 
         /*
          * attend to decayed values
          */
 
-        auto &q_reg = w_reg;
-        load(q_reg, _q + time_index*q_reg.num_elements, q_reg.cols); // q = q.clone()
-
-        kernel(tt_reg, q_reg, k_reg);
-        make_causal(tt_reg, tt_reg, 0);
-
-        auto &y_reg = w_reg;
-        attend(y_reg, tt_reg, u_reg);
-
-        store(_y + time_index*y_reg.num_elements, y_reg, y_reg.cols);
-    }
-
-    __syncthreads();
-
-    if (warpid == 0) {
-        loop<T, D, ACCUM, _time, _key, _value, kChunkSize>(_q, _k, _w, _u, _y, num_chunks);
-    }
-}
-
-template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kChunkSize>
-__device__ static void loop(
-    const T *_q,
-    const T *_k,
-    const T *_w,
-    const T *_u,
-    T *_y,
-    const int num_chunks
-) {
-    rt<D, _value, _key> state;
-    rt<ACCUM, _value, _key> mma_state;
-    rt<D, _time, _key> q, k, w;
-    rt<D, _time, _value> u, y;
-    rt<D, _time, _time> qk;
-
-    int chunk = 0;
-
-    load(k, _k + chunk*k.num_elements, k.cols);
-    load(u, _u + chunk*u.num_elements, u.cols);
-    zero(mma_state);
-
-    for (chunk = 1; chunk < num_chunks; chunk++) {
-        associate(state, u, k, mma_state, true);
-
-        load(w, _w + chunk*w.num_elements, w.cols);
-        query(u, state, w); // u_old
-
+        auto &q = bk;
         load(q, _q + chunk*q.num_elements, q.cols);
-        load(k, _k + chunk*k.num_elements, k.cols);
 
         kernel(qk, q, k);
         make_causal(qk, qk, 0);
 
-        load(y, _y + chunk*y.num_elements, y.cols);
+        auto &y = v;
+        attend(y, qk, u);
 
-        auto &y_prev = w; // repurpose w
-        attend(y_prev, qk, u);
-        sub(y, y, y_prev);
-
-        auto &y_cur = w; // repurpose w again
-        query(y_cur, state, q);
-        add(y, y, y_cur);
+        loop(shared_state, mma_state, q, k, w, u, y, kNumWarps, time_block);
 
         store(_y + chunk*y.num_elements, y, y.cols);
-
-        auto &u1 = y; // repurpose y
-        load(u1, _u + chunk*u1.num_elements, u1.cols);
-        sub(u, u1, u);
     }
 }
 
-/**
- * @brief Bind a list of vectors (k,u) and write them to a dictionary state_delta.
- */
-template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
-__device__ static inline void associate(
-    rt<D, _value, _key, ducks::rt_layout::row> &state_delta,
-    /*const*/ rt<D, _time, _value, ducks::rt_layout::row> &v,
-    /*const*/ rt<D, _time, _key, ducks::rt_layout::row> &k
-) {
-    rt<ACCUM, _value, _key> mma_state;
-    associate(state_delta, v, k, mma_state, false);
-}
-
-/**
- * @brief Bind a list of vectors (k,u) and write them to a dictionary state_delta.
- */
-template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
-__device__ static inline void associate(
-    rt<D, _value, _key, ducks::rt_layout::row> &state_delta,
-    /*const*/ rt<D, _time, _value, ducks::rt_layout::row> &v,
-    /*const*/ rt<D, _time, _key, ducks::rt_layout::row> &k,
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value>
+__device__ static inline void loop(
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
     rt<ACCUM, _value, _key> &mma_state,
-    const bool accum = false
+    rt<D, _time, _key> &q,
+    rt<D, _time, _key> &k,
+    rt<D, _time, _key> &w, // will be repurposed
+    rt<D, _time, _value> &u, // will be repurposed
+    rt<D, _time, _value> &y,
+    const int kNumWarps,
+    const int time_block
 ) {
-    if (accum == false) {
-        zero(mma_state);
+    auto warpid = kittens::warpid();
+
+    rt<D, _value, _key> state;
+    rt<D, _time, _value> u_old;
+    rt<D, _time, _time> qk;
+
+    __syncthreads();
+
+    // all warps execute sequentially, passing state through the shared memory
+    for (int warp = 0; warp < kNumWarps; warp++) {
+        if (warp == warpid) {
+            int chunk = time_block * kNumWarps + warpid;
+
+            if (time_block > 0 || chunk > 0) {
+                load(state, shared_state);
+                copy(mma_state, state);
+
+                query(u_old, state, w);
+
+                kernel(qk, q, k);
+                make_causal(qk, qk, 0);
+
+                auto &y_prev = w; // repurpose w
+                attend(y_prev, qk, u_old);
+                sub(y, y, y_prev);
+
+                auto &y_cur = w; // repurpose w again
+                query(y_cur, state, q);
+                add(y, y, y_cur);
+
+                sub(u, u, u_old);
+            } else {
+                zero(mma_state);
+            }
+
+            associate(state, u, k, mma_state, true);
+            store(shared_state, state);
+        }
+
+        __syncthreads();
     }
-    auto &k_col = swap_layout_inplace(k);
-    auto &v_col = swap_layout_inplace(v);
-    mma_AtB(mma_state, v_col, k_col, mma_state);
-    swap_layout_inplace(k_col);
-    swap_layout_inplace(v_col);
-    copy(state_delta, mma_state);
-}
-
-
-template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
-__device__ static inline void query(
-    rt<D, _time, _value, ducks::rt_layout::row> &output_values,
-    const rt<D, _value, _key, ducks::rt_layout::row> &state,
-    const rt<D, _time, _key, ducks::rt_layout::row> &query
-) {
-    rt<ACCUM, _time, _value> mma;
-
-    zero(mma);
-    mma_ABt(mma, query, state, mma); // einsum('tk,vk->tv', query, state)
-    copy(output_values, mma);
-}
-
-template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
-__device__ static inline void reverse_query(
-    rt<D, _time, _key, ducks::rt_layout::row> &output_keys,
-    const rt<D, _time, _value, ducks::rt_layout::row> &value_query,
-    /*const*/ rt<D, _value, _key, ducks::rt_layout::row> &state
-) {
-    rt<ACCUM, _time, _key> mma;
-
-    zero(mma);
-    auto &state_col = swap_layout_inplace(state);
-    mma_AB(mma, value_query, state_col, mma); // einsum('tv,vk->tk', value_query, state)
-    copy(output_keys, mma);
-    swap_layout_inplace(state_col);
-}
-
-
-template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _key>
-__device__ static inline void kernel(
-    rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    const rt<D, _time_source, _key, ducks::rt_layout::row> &query,
-    const rt<D, _time_target, _key, ducks::rt_layout::row> &key
-) {
-    rt<ACCUM, _time_source, _time_target> qk;
-
-    zero(qk);
-    mma_ABt(qk, query, key, qk); // mma_TT = einsum('nsk,ntk->nst', q, k)
-    copy(attention, qk);
-}
-
-template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
-__device__ static inline void attend(
-    rt<D, _time_source, _value, ducks::rt_layout::row> &mixtures,
-    const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    /*const*/ rt<D, _time_target, _value, ducks::rt_layout::row> &values
-) {
-    rt<ACCUM, _time_source, _value> mma;
-
-    zero(mma);
-    auto &values_col = swap_layout_inplace(values);
-    mma_AB(mma, attention, values_col, mma);
-    copy(mixtures, mma);
-    swap_layout_inplace(values_col);
-}
-
-template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
-__device__ static inline void reverse_attend(
-    rt<D, _time_target, _value, ducks::rt_layout::row> &mixtures,
-    /*const*/ rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    /*const*/ rt<D, _time_source, _value, ducks::rt_layout::row> &source_values
-) {
-    auto &source_values_col = swap_layout_inplace(source_values);
-    reverse_attend(mixtures, attention, source_values_col);
-    swap_layout_inplace(source_values_col);
-}
-
-template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
-__device__ static inline void reverse_attend(
-    rt<D, _time_target, _value, ducks::rt_layout::row> &mixtures,
-    /*const*/ rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    /*const*/ rt<D, _time_source, _value, ducks::rt_layout::col> &source_values_col
-) {
-    rt<ACCUM, _time_target, _value> mma;
-    reverse_attend(attention, source_values_col, mma);
-    copy(mixtures, mma);
-}
-
-template <typename D, typename ACCUM, int _time_source, int _time_target, int _value>
-__device__ static inline void reverse_attend(
-    /*const*/ rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
-    /*const*/ rt<D, _time_source, _value, ducks::rt_layout::col> &source_values_col,
-    rt<ACCUM, _time_target, _value> &mma,
-    const bool accum = false
-) {
-    if (!accum) {
-        zero(mma);
-    }
-    auto &attention_col = swap_layout_inplace(attention);
-    mma_AtB(mma, attention_col, source_values_col, mma);
-    swap_layout_inplace(attention_col);
-}
-
-
-
-struct op_negate {
-    template<typename T> static __device__ inline T op(const T &x) { return -x; }
-};
-
-template<ducks::rt::all T>
-__device__ static inline void negate(T &dst) {
-    unary_map<op_negate, T>(dst, dst);
 }
 
 template <typename T, typename D, typename ACCUM = float2, int _time, int _key, int _value>
@@ -619,7 +313,7 @@ __device__ static void loop_backward(
 
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
-__global__ void backward_kernel(
+__global__ void delta_backward_kernel(
     int num_chunks,
     H* __restrict__ __d_out_w__,
     H* __restrict__ __d_out_u__,
@@ -958,8 +652,8 @@ forward(
         unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
-        CHECK_CUDA_ERROR(cudaFuncSetAttribute(forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch,threads,mem_size>>>( \
+        CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
+        delta_forward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch,threads,mem_size>>>( \
             (int)num_chunks, \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             w.data_ptr<H>(), u.data_ptr<H>(), y.data_ptr<H>())
@@ -1027,8 +721,8 @@ backward(
         unsigned long mem_size = kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>) \
                                + kNumWarps*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>); \
-        CHECK_CUDA_ERROR(cudaFuncSetAttribute(backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
+        CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
+        delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
             (int)num_chunks, \
             d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(), d_out_y.data_ptr<H>(), \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
