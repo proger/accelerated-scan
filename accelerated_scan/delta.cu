@@ -162,7 +162,7 @@ __device__ static inline void loop(
     rt<D, _time, _key> &k,
     rt<D, _time, _time> &qk,
     rt<D, _time, _key> &w, // will be repurposed
-    rt<D, _time, _value> &u, // will be repurposed
+    rt<D, _time, _value> &u,
     rt<D, _time, _value> &y,
     const int chunk,
     barrier (&batons)[kNumWarps]
@@ -194,6 +194,13 @@ __device__ static inline void loop(
         zero(mma_state);
     }
 
+    if (chunk > 0) {
+        add(y, y, y_buf);
+
+        attend(y_buf, qk, u_old);
+        sub(y, y, y_buf);
+    }
+
     associate(state, u, k, mma_state, true);
     store(shared_state, state);
 
@@ -202,13 +209,6 @@ __device__ static inline void loop(
         auto token = batons[(warpid + 1) % kNumWarps].arrive();
     }
     __syncwarp();
-
-    if (chunk > 0) {
-        add(y, y, y_buf);
-
-        attend(y_buf, qk, u_old);
-        sub(y, y, y_buf);
-    }
 }
 
 template <typename T, typename D, typename ACCUM = float2, int _time, int _key, int _value>
@@ -635,13 +635,13 @@ __global__ void delta_backward_kernel(
     } else if (d == 64) { \
         TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 2, 4)); \
     } else if (d == 128) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 4, 8)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 4, 2)); \
     } else if (d == 256) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 8, 8)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 8, 2)); \
     } else if (d == 512) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 16, 8)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 16, 2)); \
     } else if (d == 1024) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 32, 8)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 32, 2)); \
     } else { \
         TORCH_CHECK(false, "[qkv].size(2) should be 16, 32, 64, 128, 256, 512 or 1024"); \
     }

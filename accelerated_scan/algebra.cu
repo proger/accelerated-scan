@@ -240,6 +240,26 @@ __device__ static inline void associate(
     copy(state_delta, mma_state);
 }
 
+/**
+ * @brief Bind a list of vectors (k,u) and write them to a dictionary state_delta.
+ */
+template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
+__device__ static inline void associate(
+    rt<D, _value, _key, ducks::rt_layout::row> &state_delta,
+    /*const*/ rt<D, _time, _value, ducks::rt_layout::col> &v_col,
+    /*const*/ rt<D, _time, _key, ducks::rt_layout::row> &k,
+    rt<ACCUM, _value, _key> &mma_state,
+    const bool accum = false
+) {
+    if (accum == false) {
+        zero(mma_state);
+    }
+    auto &k_col = swap_layout_inplace(k);
+    mma_AtB(mma_state, v_col, k_col, mma_state);
+    swap_layout_inplace(k_col);
+    copy(state_delta, mma_state);
+}
+
 
 template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
 __device__ static inline void query(
@@ -299,13 +319,22 @@ __device__ static inline void attend(
     const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
     /*const*/ rt<D, _time_target, _value, ducks::rt_layout::row> &values
 ) {
+    auto &values_col = swap_layout_inplace(values);
+    attend(mixtures, attention, values_col);
+    swap_layout_inplace(values_col);
+}
+
+template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
+__device__ static inline void attend(
+    rt<D, _time_source, _value, ducks::rt_layout::row> &mixtures,
+    const rt<D, _time_source, _time_target, ducks::rt_layout::row> &attention,
+    const rt<D, _time_target, _value, ducks::rt_layout::col> &values_col
+) {
     rt<ACCUM, _time_source, _value> mma;
 
     zero(mma);
-    auto &values_col = swap_layout_inplace(values);
     mma_AB(mma, attention, values_col, mma);
     copy(mixtures, mma);
-    swap_layout_inplace(values_col);
 }
 
 template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _value>
