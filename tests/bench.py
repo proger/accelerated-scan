@@ -16,7 +16,8 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         x_names=["SEQUENCE_LENGTH"],  # argument names to use as an x-axis for the plot
         #x_vals=[2**i for i in range(7, max_exponent)],
         #x_vals=[512,1024,2048,4096,8192,16384],
-        x_vals=[128,256,512],
+        x_vals=[64,128,256,512,1024,2048,4096,8192,16384],
+        #x_vals=[1024],
         #x_vals=[512,1024,2048,4096,8192,16384],
         xlabel='sequence length',
         ylabel='ms',
@@ -27,8 +28,16 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         #line_vals=["triton", "ref", "warp"],
         #line_names=["flash", "kittenexp", "warp"],
         #line_vals=["flash", "kittenexp", "warp"],
-        line_names=["linear-kitten", "flash2", "delta"],
-        line_vals=["kitten", "flash", "delta"],
+        #line_names=["linear", "flash2", "delta", "scan"],
+        #line_vals=["kitten", "flash", "delta", "warp"],
+        #line_names=["delta", "fla"],
+        #line_vals=["delta", "fla"],
+        
+        #line_names=["linear", "flash2", "delta", "fla", "scan"],
+        #line_vals=["kitten", "flash", "delta", "fla", "warp"],
+
+        line_names=["flash2", "delta", "fla", "scan"],
+        line_vals=["flash", "delta", "fla", "warp"],
         plot_name=plot_name,
         args={
             "direction": direction,
@@ -45,7 +54,7 @@ from collections import defaultdict
 c = defaultdict(int)
 
 def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward", "backward", "train"] = "forward"):
-    B, H, D, T = 32, 64, 32, SEQUENCE_LENGTH
+    B, H, D, T = 1, 82, 64, SEQUENCE_LENGTH
     gates, tokens = init(B, H*D, T, device=device, requires_grad=direction=="train")
     outputs = torch.empty_like(tokens)
     grad_outputs = torch.empty_like(tokens)
@@ -149,6 +158,29 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
                 case "forward":
                     def scan():
                         delta_forward(q, k, v, f, w, u, o)
+
+        case "fla":
+            print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
+            from fla.ops.delta_rule.chunk_fuse import fused_chunk_delta_rule
+            gates, tokens = init(B, H, T, device=device, requires_grad=direction=="train")
+
+            k = tokens.unsqueeze(-1).expand(B, H, T, D).bfloat16().contiguous()
+            q = torch.ones_like(k).bfloat16().contiguous()
+            v = torch.ones_like(q).bfloat16().contiguous()
+            f = gates.bfloat16().contiguous()
+            o = torch.empty_like(v).bfloat16().contiguous()
+
+            k = k.view(B, H, T, D)
+            q = q.view(B, H, T, D)
+            v = v.view(B, H, T, D)
+            f = f.view(B, H, T)
+            o = o.view(B, H, T, D)
+            
+            match direction:
+                case "forward":
+                    def scan():
+                        fused_chunk_delta_rule(q, k, v, f, BT=16)
+
         case _:
             raise ValueError(f"Unknown provider {provider}")
 
