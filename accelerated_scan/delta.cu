@@ -17,8 +17,14 @@ static __device__ inline void decay_values_forward(
     rt<D, _time, _value> &u_bases_reg, // can be aliased to v_reg
     rt<D, _time, _key> &bk_reg
 ) {
-    using col = rt<D, _time, _key, ducks::rt_layout::col>;
     rt<D, _time, _key> tk_reg;
+    rt<D, _time, _value> tv_reg;
+
+    rt<D, _time, _time> tt;
+    rv<D, _time, 2> decay;
+    rv<D, _time, 1> decay_1;
+    rv<D, _key, 2> decay_w;
+    rv<D, _value, 2> decay_u;
 
     mul_row(bk_reg, k_reg, beta_reg); // k = einsum('ntk,nt->ntk', k, beta)
 
@@ -28,17 +34,34 @@ static __device__ inline void decay_values_forward(
 
     mul_row(bKl_reg, tt_reg, beta_reg); // tt = einsum('nts,nt->nts', tt, beta)
 
-    zero(w_reg);
-    zero(u_reg);
     copy(u_bases_reg, v_reg);
     mul_row(v_reg, v_reg, beta_reg); // v = einsum('ntw,nt->ntw', v, beta)
 
-    for (auto t = 0; t < w_reg.rows; t++) {
-        reverse_query(tk_reg, bKl_reg, w_reg);
+    copy(w_reg, bk_reg);
+    copy(u_reg, v_reg);
+
+    #pragma unroll
+    for (auto t = 1; t < w_reg.rows; t++) {
+        // select row t from bKl
+        zeroexcept(tt, bKl_reg, t);
+        col_sum(decay, tt);
+        copy(decay_1, decay);
+
+        // ALT: reverse_query(tk_reg, bKl_reg, w_reg);
+        broadcast_row(tk_reg, decay_1);
+        mul(tk_reg, w_reg, tk_reg);
+        col_sum(decay_w, tk_reg); // decay_w is 1xK vector
+        broadcast_col(tk_reg, decay_w);
+
         op_singlerow<base_ops::sub>(w_reg, bk_reg, tk_reg, t); // w[t] = bk[t] - tk[t]
     
-        reverse_query(tk_reg, bKl_reg, u_reg);
-        op_singlerow<base_ops::sub>(u_reg, v_reg, tk_reg, t); // u[t] = bv[t] - tk[t]
+        // ALT: reverse_query(tv_reg, bKl_reg, u_reg);
+        broadcast_row(tv_reg, decay_1);
+        mul(tv_reg, u_reg, tv_reg);
+        col_sum(decay_u, tv_reg); // decay_u is 1xV vector
+        broadcast_col(tv_reg, decay_u);
+
+        op_singlerow<base_ops::sub>(u_reg, v_reg, tv_reg, t); // u[t] = bv[t] - tv[t]
     }
 }
 
