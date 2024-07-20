@@ -67,6 +67,40 @@ __device__ static inline void op_singlerow(T &dst, const T &lhs, const T &rhs, c
     }
 }
 
+template<typename T, int _time, int _key>
+__device__ static inline void zeroexcept(
+    rt<T, _time, _key> &dst,
+    const rt<T, _time, _key> &src,
+    const int row_index
+) {
+    const int row_top = laneid() / 4;
+    const int row_bottom = row_top + 8;
+
+    static_assert(dst.packed_per_tile == 4, "packed_per_tile must be 4");
+    //using dtype = T::dtype;
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {            
+            if (row_top != row_index) {
+                dst.tiles[i][j].data[0] = {0.0, 0.0};
+                dst.tiles[i][j].data[2] = {0.0, 0.0};
+            } else {
+                dst.tiles[i][j].data[0] = src.tiles[i][j].data[0];
+                dst.tiles[i][j].data[2] = src.tiles[i][j].data[2];
+            }
+            if (row_bottom != row_index) {
+                dst.tiles[i][j].data[1] = {0.0, 0.0};
+                dst.tiles[i][j].data[3] = {0.0, 0.0};
+            } else {
+                dst.tiles[i][j].data[1] = src.tiles[i][j].data[1];
+                dst.tiles[i][j].data[3] = src.tiles[i][j].data[3];
+            }
+        }
+    }
+}
+
 
 template<ducks::rt::all RT>
 __device__ static inline void reset_trailing_rows(RT &dst, const int row_index, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
@@ -226,14 +260,24 @@ __device__ static inline void reverse_query(
     const rt<D, _time, _value, ducks::rt_layout::row> &value_query,
     /*const*/ rt<D, _value, _key, ducks::rt_layout::row> &state
 ) {
+    auto &state_col = swap_layout_inplace(state);
+    reverse_query(output_keys, value_query, state_col);
+    swap_layout_inplace(state_col);
+}
+
+template <typename D, typename ACCUM = float2, int _time, int _key, int _value>
+__device__ static inline void reverse_query(
+    rt<D, _time, _key, ducks::rt_layout::row> &output_keys,
+    const rt<D, _time, _value, ducks::rt_layout::row> &value_query,
+    /*const*/ rt<D, _value, _key, ducks::rt_layout::col> &state_col
+) {
     rt<ACCUM, _time, _key> mma;
 
     zero(mma);
-    auto &state_col = swap_layout_inplace(state);
     mma_AB(mma, value_query, state_col, mma); // einsum('tv,vk->tk', value_query, state)
     copy(output_keys, mma);
-    swap_layout_inplace(state_col);
 }
+
 
 
 template <typename D, typename ACCUM = float2, int _time_source, int _time_target, int _key>
