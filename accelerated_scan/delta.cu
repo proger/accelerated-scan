@@ -263,9 +263,8 @@ __device__ static inline void chunk_backward(
     T *_d_u,
     const int chunk,
     const int num_chunks,
-    // shared stuff:
-    rt<D, _value, _key> &state,
-    rt<D, _value, _key> &d_state
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_d_state
 ) {
     
     rt<D, _time, _time> qk;
@@ -273,7 +272,10 @@ __device__ static inline void chunk_backward(
     rt<D, _time, _value> d_u;
     rt<D, _time, _key> d_q, d_k;
     rt<D, _time, _key> tk;
-    rt<D, _value, _key> state_delta;
+    rt<D, _value, _key> state, d_state, state_delta;
+
+    load(state, shared_state);
+    load(d_state, shared_d_state);
 
     if (chunk == 0) {
         query(tk, d_state, k);
@@ -337,6 +339,9 @@ __device__ static inline void chunk_backward(
         associate(state_buf, d_state_decays, w);
         add(d_state, d_state, state_buf);
     }
+
+    store(shared_state, state);
+    store(shared_d_state, d_state);
 }
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
@@ -378,7 +383,9 @@ __global__ void delta_backward_kernel(
     shared_allocator al((int*)&__shm[0]);
     
     st<T, _value, _key, ducks::st_layout::swizzle> (&shared_states)[1] = al.allocate<st<T, _value, _key, ducks::st_layout::swizzle>, 1>();
+    st<T, _value, _key, ducks::st_layout::swizzle> (&shared_d_states)[1] = al.allocate<st<T, _value, _key, ducks::st_layout::swizzle>, 1>();
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state = shared_states[0];
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_d_state = shared_d_states[0];
 
     /*
      * register allocations
@@ -401,7 +408,6 @@ __global__ void delta_backward_kernel(
     // registers for stitch backwards 
     rt<D, _time, _key> q;
     rt<D, _time, _value> d_y;
-    rt<D, _value, _key> state, d_state;
 
     __shared__ barrier batons[kNumWarps];
     auto block = cooperative_groups::this_thread_block();
@@ -454,8 +460,7 @@ __global__ void delta_backward_kernel(
          * loop backward
          */
 
-        load(state, shared_state);
-        zero(d_state);
+        zero(shared_d_state);
 
         for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
             load(q, _q + chunk*q.num_elements, q.cols);
@@ -467,13 +472,13 @@ __global__ void delta_backward_kernel(
                 q, k_reg, w_reg, u_reg, d_y,
                 _d_q, _d_k, _d_out_w, _d_out_u,
                 chunk, num_chunks,
-                state, d_state
+                shared_state, shared_d_state
             );
         }
     }
     __syncthreads();
 
-    for (int time_block = 0; time_block < (num_chunks + kNumWarps - 1) / kNumWarps; time_block++) {
+    for (int time_block = 0; time_block < time_blocks; time_block++) {
         int chunk = time_block * kNumWarps + warpid;
         if (chunk >= num_chunks) {
             break;
@@ -803,7 +808,7 @@ backward(
         constexpr int kWidth = _kWidth*_kWidthGroups; \
         constexpr int kNumWarps = _kNumWarps; \
         auto threads = kNumWarps * kittens::WARP_THREADS; \
-        unsigned long mem_size = sizeof(st<T, kWidth, kWidth, ducks::st_layout::swizzle>) + kNumWarps*sizeof(barrier); \
+        unsigned long mem_size = 2*sizeof(st<T, kWidth, kWidth, ducks::st_layout::swizzle>) + kNumWarps*sizeof(barrier); \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
         delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
             (int)num_chunks, \
