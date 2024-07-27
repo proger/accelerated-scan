@@ -71,10 +71,57 @@ def decay_values(q, k, v, beta, chunk_size=2):
     w = beta__ * k_.clone()
     u = beta__ * v_.clone()
     K = einsum('nsd,ntd->nst', k_, k_) # (chunk_size,chunk_size) matrix
+    K = K.tril(diagonal=-1)
+
+    bKl = einsum('ns,nst->nst', beta_, K)
+    bKlT = einsum('nst->nts', bKl)
+
+    # for t in range(1,chunk_size):
+    #     w[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, t, :t], w[:, :t].clone())
+    #     u[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, t, :t], u[:, :t].clone())
+
+    def mul_row(c, m):
+        "multiply every row of m with its corresponding c"
+        #return einsum('nt,ntd->ntd', c, m)
+        return einsum('ntI,ntd->ntd', c, m)
+
+    def col_sum(m):
+        "sum all columns into one row"
+        #return m.sum(-2)
+        return m.sum(-2, keepdim=True)
+
+    def row_sum(m):
+        "sum all rows into one column"
+        #return m.sum(-1)
+        return m.sum(-1, keepdim=True)
+
+    def col_select(x, t):
+        x = x.clone()
+        x[:, :, :t] = 0
+        x[:, :, t+1:] = 0
+        c = row_sum(x)
+        return c
+
+    def add(zero_tile, row_vector):
+        return zero_tile + row_vector
 
     for t in range(1,chunk_size):
-        w[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, :t, t], w[:, :t].clone())
-        u[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, :t, t], u[:, :t].clone())
+        col = col_select(bKlT, t) # this is a col vector
+
+        decay_w_all = mul_row(col, w.clone())
+        decay_w = col_sum(decay_w_all) # this is a row vector
+
+        decay_u_all = mul_row(col, u.clone())
+        decay_u = col_sum(decay_u_all) # this is a row vector
+
+        z = torch.zeros_like(w)
+        z = add(z, decay_w)
+        
+        w[:, t] = w[:, t] - z[:, t]
+
+        z = torch.zeros_like(w)
+        z = add(z, decay_u)
+        u[:, t] = u[:, t] - z[:, t]
 
     # attend to decayed values
     qk = einsum("nsk,ntk->nst", q_, k_)
@@ -446,11 +493,11 @@ class Delta(torch.autograd.Function):
 
 
 def test_delta():
-    NH, T, D = 1, 64, 16
+    NH, T, D = 1, 16, 16
     q1, k1, v1, beta1 = make_example(NH, T, D)
 
     y0 = forward_loop(q1, k1, v1, beta1)
-    chunk_size = 8
+    chunk_size = 16
     
     w1, u1, y1 = forward(q1, k1, v1, beta1, chunk_size=chunk_size)
     (y1 - torch.ones_like(y1).detach()).pow(2).mean().backward()
