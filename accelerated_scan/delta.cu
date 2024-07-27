@@ -155,6 +155,23 @@ __global__ void delta_forward_kernel(
 }
 
 template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps>
+__device__ static inline void loop_nooutput(
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
+    rt<ACCUM, _value, _key> &mma_state,
+    rt<D, _time, _key> &q,
+    rt<D, _time, _key> &k,
+    rt<D, _time, _time> &qk,
+    rt<D, _time, _key> &w, // will be repurposed
+    rt<D, _time, _value> &u,
+    const int chunk,
+    barrier (&batons)[kNumWarps]
+) {
+    return loop_impl<T, D, ACCUM, _time, _key, _value, kNumWarps, false>(
+        shared_state, mma_state, q, k, qk, w, u, nullptr, chunk, batons
+    );
+}
+
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps>
 __device__ static inline void loop(
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
     rt<ACCUM, _value, _key> &mma_state,
@@ -164,6 +181,24 @@ __device__ static inline void loop(
     rt<D, _time, _key> &w, // will be repurposed
     rt<D, _time, _value> &u,
     rt<D, _time, _value> &y,
+    const int chunk,
+    barrier (&batons)[kNumWarps]
+) {
+    return loop_impl<T, D, ACCUM, _time, _key, _value, kNumWarps, true>(
+        shared_state, mma_state, q, k, qk, w, u, y, chunk, batons
+    );
+}
+
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps, bool NeedsY>
+__device__ static inline void loop_impl(
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
+    rt<ACCUM, _value, _key> &mma_state,
+    rt<D, _time, _key> &q,
+    rt<D, _time, _key> &k,
+    rt<D, _time, _time> &qk,
+    rt<D, _time, _key> &w, // will be repurposed
+    rt<D, _time, _value> &u,
+    std::conditional_t<NeedsY, rt<D, _time, _value> &, std::nullptr_t> y,
     const int chunk,
     barrier (&batons)[kNumWarps]
 ) {
@@ -189,16 +224,20 @@ __device__ static inline void loop(
         query(u_old, state, w);
         sub(u, u, u_old);
 
-        query(y_buf, state, q);
+        if constexpr (NeedsY) {
+            query(y_buf, state, q);
+        }
     } else {
         zero(mma_state);
     }
 
-    if (chunk > 0) {
-        add(y, y, y_buf);
+    if constexpr (NeedsY) {
+        if (chunk > 0) {
+            add(y, y, y_buf);
 
-        attend(y_buf, qk, u_old);
-        sub(y, y, y_buf);
+            attend(y_buf, qk, u_old);
+            sub(y, y, y_buf);
+        }
     }
 
     associate(state, u, k, mma_state, true);
