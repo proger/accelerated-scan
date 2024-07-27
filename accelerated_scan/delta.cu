@@ -250,6 +250,9 @@ __device__ static inline void chunk_forward_impl(
     __syncwarp();
 }
 
+/**
+ * @brief Stitch the chunks backwards
+ */
 template <typename T, typename D, int _time, int _key, int _value>
 __device__ static inline void chunk_backward(
     rt<D, _time, _key> &q, // not needed for chunk 0
@@ -264,15 +267,27 @@ __device__ static inline void chunk_backward(
     const int chunk,
     const int num_chunks,
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
-    st<T, _value, _key, ducks::st_layout::swizzle> &shared_d_state
+    st<T, _value, _key, ducks::st_layout::swizzle> &shared_d_state,
+    barrier &self,
+    barrier &prev
 ) {
-    
+    auto laneid = kittens::laneid();
+
     rt<D, _time, _time> qk;
     rt<D, _time, _value> d_state_decays;
     rt<D, _time, _value> d_u;
     rt<D, _time, _key> d_q, d_k;
     rt<D, _time, _key> tk;
     rt<D, _value, _key> state, d_state, state_delta;
+
+    // all warps execute sequentially, passing state through the shared memory
+    if (laneid == 0) {
+        // wait until our state is ready
+        auto token = self.arrive();
+        self.wait(std::move(token));
+    }
+    __syncwarp();
+
 
     load(state, shared_state);
     load(d_state, shared_d_state);
@@ -342,6 +357,12 @@ __device__ static inline void chunk_backward(
 
     store(shared_state, state);
     store(shared_d_state, d_state);
+
+    if (laneid == 0) {
+        // gradients ƒor the previous chunk have arrived
+        auto token = prev.arrive();
+    }
+    __syncwarp();
 }
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
@@ -363,6 +384,7 @@ __global__ void delta_backward_kernel(
     H* __restrict__ __y__
 ) {
     auto warpid           = kittens::warpid();
+    auto laneid           = kittens::laneid();
     auto block_start      = blockIdx.x*(num_chunks*kChunkSize*(_key*TILE_DIM));
     auto beta_block_start = blockIdx.x*(num_chunks*kChunkSize*1); // width is 1 for beta
     const T *_d_out_y = reinterpret_cast<const T *>(__d_out_y__) + block_start,
@@ -410,90 +432,64 @@ __global__ void delta_backward_kernel(
     rt<D, _time, _value> d_y;
 
     __shared__ barrier batons[kNumWarps];
+    __shared__ barrier backward_batons[kNumWarps];
     auto block = cooperative_groups::this_thread_block();
 
     init(&batons[warpid], 2);
+    init(&backward_batons[warpid], 2);
     if (block.thread_rank() == 0) {
         auto token = batons[0].arrive();
     }
 
+    zero(shared_d_state);
     const int time_blocks = (num_chunks + kNumWarps - 1) / kNumWarps;
 
-    for (int time_block = 0; time_block < time_blocks; time_block++) {
+    for (int time_block = 0; time_block < 1; time_block++) {
         int chunk = time_block * kNumWarps + warpid;
         if (chunk >= num_chunks) {
             break;
         }
 
         /*
-         * load k, v, beta, d_out_w, d_out_u, d_out_y
+         * load q, k, v, beta, d_y
          */
 
+        load(q, _q + chunk*q.num_elements, q.cols);
         load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols); // k = k.clone()
         load(v_reg, _v + chunk*v_reg.num_elements, v_reg.cols); // v = v.clone()
         load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
+        load(d_y, _d_out_y + chunk*d_y.num_elements, d_y.cols);
 
         /*
          * decay_values_forward: compute w and u
          */
 
-        __syncthreads();
-
         decay_values_forward(tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg);
 
         copy(u_predecay_reg, u_reg); // XXX: chunk_forward_nooutput will mutate u_reg
 
-        chunk_forward_nooutput(shared_state, mma_state, k_reg, w_reg, u_reg, chunk, batons[warpid], batons[(warpid + 1) % kNumWarps]);
+        // XXX: for now we assume that num_chunks <= kNumWarps and chunk == warpid
+        barrier &forward_self = batons[warpid];
+        barrier &forward_next = chunk == num_chunks - 1 ? backward_batons[chunk] : batons[(warpid + 1) % kNumWarps];
+        barrier &backward_self = backward_batons[warpid];
+        barrier &backward_prev = backward_batons[warpid == 0 ? kNumWarps - 1 : warpid - 1];
 
-        store(_w + chunk*w_reg.num_elements, w_reg, w_reg.cols);
-        store(_u + chunk*w_reg.num_elements, u_reg, u_reg.cols);
-    }
+        chunk_forward_nooutput(shared_state, mma_state, k_reg, w_reg, u_reg, chunk, forward_self, forward_next);
+        chunk_backward(
+            q, k_reg, w_reg, u_reg, d_y,
+            _d_q, _d_k, _d_out_w, _d_out_u,
+            chunk, num_chunks,
+            shared_state, shared_d_state,
+            backward_self, backward_prev
+        );
 
-    /*
-     * stitch chunks backwards
-     */
-    __syncthreads();
-    if (warpid == 0) {
         /*
-         * from now on, u's in global memory are decayed
-         *
-         * loop backward
+         * from now on, u_reg is decayed
          */
 
-        zero(shared_d_state);
-
-        for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
-            load(q, _q + chunk*q.num_elements, q.cols);
-            load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols);
-            load(w_reg, _w + chunk*w_reg.num_elements, w_reg.cols);
-            load(u_reg, _u + chunk*u_reg.num_elements, u_reg.cols);
-            load(d_y, _d_out_y + chunk*d_y.num_elements, d_y.cols);
-            chunk_backward(
-                q, k_reg, w_reg, u_reg, d_y,
-                _d_q, _d_k, _d_out_w, _d_out_u,
-                chunk, num_chunks,
-                shared_state, shared_d_state
-            );
-        }
-    }
-    __syncthreads();
-
-    for (int time_block = 0; time_block < time_blocks; time_block++) {
-        int chunk = time_block * kNumWarps + warpid;
-        if (chunk >= num_chunks) {
-            break;
-        }
-    
-        /*
-         * reload k, v, beta, w, u
-         */
-        load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols); // k = k.clone()
-        load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
-        load(w_reg, _w + chunk*w_reg.num_elements, w_reg.cols);
-        // load(u_reg, _u + chunk*u_reg.num_elements, u_reg.cols);
         copy(u_reg, u_predecay_reg);
         // expected to be untouched: tt_reg
-
+    
         attend(w_bases_reg, tt_reg, w_reg);
         sub(w_bases_reg, k_reg, w_bases_reg);
 
@@ -730,9 +726,6 @@ forward(
     constexpr int kChunkSize = 16;
     auto num_chunks = seqlen / kChunkSize;
 
-/**/
-/*CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_forward_kernel<H, T, D, ACCUM, kHeight, kWidth*kWidthGroups, kWidth, kWidthGroups, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));*/
-
     // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
     // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
 #define DELTA_DISPATCH(_kHeight, _kWidth, _kWidthGroups, _kNumWarps) \
@@ -808,7 +801,7 @@ backward(
         constexpr int kWidth = _kWidth*_kWidthGroups; \
         constexpr int kNumWarps = _kNumWarps; \
         auto threads = kNumWarps * kittens::WARP_THREADS; \
-        unsigned long mem_size = 2*sizeof(st<T, kWidth, kWidth, ducks::st_layout::swizzle>) + kNumWarps*sizeof(barrier); \
+        unsigned long mem_size = 2*sizeof(st<T, kWidth, kWidth, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
         delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
             (int)num_chunks, \
