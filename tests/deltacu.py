@@ -104,6 +104,6 @@ def test_longf(T, D):
 
 if __name__ == '__main__':
     #pytest.main([__file__, "--disable-warnings", "-v"])
-    test_forward(T=32, D=32)
-    #test_backward()
+    #test_forward(T=128, D=16)
+    test_backward(T=128, D=16)
     #test_forward(T=32, D=16)
