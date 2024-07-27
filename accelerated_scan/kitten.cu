@@ -106,12 +106,12 @@ attend(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor f, torch
     TORCH_CHECK(v.scalar_type() == c10::ScalarType::BFloat16, "V is a Bfloat");
 
     using H = c10::BFloat16;
-    constexpr int kHeight = 4; // tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
-    constexpr int kWidth = 2; // tiles per vector, 2 means head dimension is 2*16 = 32
+    constexpr int kHeight = 2; // tiles per sequence block, 4 means 4*16 = 64 sequence elements per warp
+    constexpr int kWidth = 2; // tiles per vector, 4 means head dimension is 4*16 = 64
     TORCH_CHECK(d == 32, "q.size(3) and k.size(3) should be 32");
     TORCH_CHECK(dv == 32, "v.size(3) should be 32");
 
-    constexpr int kNumWorkers = 8;
+    constexpr int kNumWorkers = 16;
 
     unsigned long mem_size = 2*kNumWorkers*sizeof(st_bf<kHeight, kWidth, ducks::st_layout::swizzle>);
 
