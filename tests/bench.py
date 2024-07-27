@@ -16,7 +16,7 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         x_names=["SEQUENCE_LENGTH"],  # argument names to use as an x-axis for the plot
         #x_vals=[2**i for i in range(7, max_exponent)],
         #x_vals=[512,1024,2048,4096,8192,16384],
-        x_vals=[64,128,256,512,1024,2048,4096,8192,16384],
+        x_vals=[256,512,1024,2048,4096,8192,16384],
         #x_vals=[1024],
         #x_vals=[512,1024,2048,4096,8192,16384],
         xlabel='sequence length',
@@ -33,11 +33,11 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         #line_names=["delta", "fla"],
         #line_vals=["delta", "fla"],
         
-        #line_names=["linear", "flash2", "delta", "fla", "scan"],
-        #line_vals=["kitten", "flash", "delta", "fla", "warp"],
+        line_names=["linear", "flash2", "delta", "fla-delta", "warpscan"],
+        line_vals=["kitten", "flash", "delta", "fla", "warp"],
 
-        line_names=["flash2", "delta", "fla", "scan"],
-        line_vals=["flash", "delta", "fla", "warp"],
+        # line_names=["flash2", "delta", "fla", "scan"],
+        # line_vals=["flash", "delta", "fla", "warp"],
         plot_name=plot_name,
         args={
             "direction": direction,
@@ -54,7 +54,7 @@ from collections import defaultdict
 c = defaultdict(int)
 
 def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward", "backward", "train"] = "forward"):
-    B, H, D, T = 1, 82, 64, SEQUENCE_LENGTH
+    B, H, D, T = 1, 82, 32, SEQUENCE_LENGTH
     gates, tokens = init(B, H*D, T, device=device, requires_grad=direction=="train")
     outputs = torch.empty_like(tokens)
     grad_outputs = torch.empty_like(tokens)
