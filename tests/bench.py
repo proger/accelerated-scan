@@ -33,8 +33,11 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         #line_names=["delta", "fla"],
         #line_vals=["delta", "fla"],
         
-        line_names=["linear", "flash2", "delta", "fla-delta", "warpscan"],
-        line_vals=["kitten", "flash", "delta", "fla", "warp"],
+        #line_names=["linear", "flash2", "delta", "fla-delta", "warpscan"],
+        #line_vals=["kitten", "flash", "delta", "fla", "warp"],
+
+        line_names=["flash2", "delta", "fla-delta", "warpscan"],
+        line_vals=["flash", "delta", "fla", "warp"],
 
         # line_names=["flash2", "delta", "fla", "scan"],
         # line_vals=["flash", "delta", "fla", "warp"],
@@ -133,10 +136,11 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
             match direction:
                 case "forward":
                     scan = lambda: scaled_dot_product_attention(q, k, v, is_causal=True)
-
+                case "train":
+                    scan = lambda: scaled_dot_product_attention(q, k, v, is_causal=True)
         case "delta":
             print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
-            from accelerated_scan.kitten import delta_forward
+            from accelerated_scan.kitten import delta_forward, delta_backward, delta
 
             gates, tokens = init(B, H, T, device=device, requires_grad=direction=="train")
 
@@ -151,13 +155,14 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
             v = v.view(B*H, T, D)
             f = f.view(B*H, T)
             o = o.view(B*H, T, D)
-            w = k.new_zeros(B*H, T, D)
-            u = v.new_zeros(B*H, T, D)
             
             match direction:
                 case "forward":
                     def scan():
-                        delta_forward(q, k, v, f, w, u, o)
+                        delta_forward(q, k, v, f, o)
+                case "train":
+                    def scan():
+                        delta(q, k, v, f)
 
         case "fla":
             print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
