@@ -32,15 +32,13 @@ def test_backward(T, D):
     d_k1 = k.new_zeros(NH, T, D)
     d_v1 = v.new_zeros(NH, T, D)
     d_beta1 = beta.new_zeros(NH, T)
-    w1 = k.new_zeros(NH, T, D) # placeholder
     u1 = v.new_zeros(NH, T, D) # placeholder
-    y1 = v.new_zeros(NH, T, D) # placeholder
     from accelerated_scan import kitten
     kitten.delta_backward(
         d_out_w.clone(), d_out_u.clone(), d_out_y.clone(),
         q, k, v, beta,
         d_q1, d_k1, d_v1, d_beta1,
-        w1, u1, y1
+        u1
     )
 
     torch.set_printoptions(precision=4, sci_mode=False, linewidth=300)
@@ -87,11 +85,9 @@ def test_forward(T, D):
     #     y.view(NH, C, chunk_size, D).view(NH,T,D)
     # )
 
-    w2 = w.new_zeros(NH, T, D)
-    u2 = u.new_zeros(NH, T, D)
     y2 = y.new_zeros(NH, T, D)
     from accelerated_scan import kitten
-    kitten.delta_forward(q, k, v, beta, w2, u2, y2)
+    kitten.delta_forward(q, k, v, beta, y2)
 
     assert allclose(y, y2, atol=1e-2), 'y2 is wrong'
 

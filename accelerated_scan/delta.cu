@@ -73,8 +73,6 @@ __global__ void delta_forward_kernel(
     const H* __restrict__ __k__,
     const H* __restrict__ __v__,
     const H* __restrict__ __beta__,
-    H* __restrict__ __w__,
-    H* __restrict__ __u__,
     H* __restrict__ __y__
 ) {
     auto warpid           = kittens::warpid();
@@ -85,9 +83,7 @@ __global__ void delta_forward_kernel(
             *_k = reinterpret_cast<const T *>(__k__) + block_start,
             *_v = reinterpret_cast<const T *>(__v__) + block_start,
             *_beta = reinterpret_cast<const T *>(__beta__) + beta_block_start;
-          T *_w = reinterpret_cast<T *>(__w__) + block_start,
-            *_u = reinterpret_cast<T *>(__u__) + block_start,
-            *_y = reinterpret_cast<T *>(__y__) + block_start;
+          T *_y = reinterpret_cast<T *>(__y__) + block_start;
 
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
@@ -385,9 +381,7 @@ __global__ void delta_backward_kernel(
     H* __restrict__ __d_k__,
     H* __restrict__ __d_v__,
     H* __restrict__ __d_beta__,
-    H* __restrict__ __w__,
-    H* __restrict__ __u__,
-    H* __restrict__ __y__
+    H* __restrict__ __u__
 ) {
     auto warpid           = kittens::warpid();
     auto laneid           = kittens::laneid();
@@ -404,9 +398,7 @@ __global__ void delta_backward_kernel(
             *_d_k = reinterpret_cast<T *>(__d_k__) + block_start,
             *_d_v = reinterpret_cast<T *>(__d_v__) + block_start,
             *_d_beta = reinterpret_cast<T *>(__d_beta__) + beta_block_start,
-            *_w = reinterpret_cast<T *>(__w__) + block_start,
-            *_u = reinterpret_cast<T *>(__u__) + block_start,
-            *_y = reinterpret_cast<T *>(__y__) + block_start;
+            *_u = reinterpret_cast<T *>(__u__) + block_start;
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
     
@@ -748,22 +740,18 @@ __device__ static inline void decay_values_backward(
 void
 forward(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
-    torch::Tensor w, torch::Tensor u, torch::Tensor y
+    torch::Tensor y
 ) {
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
     CHECK_INPUT(beta);
-    CHECK_INPUT(w);
-    CHECK_INPUT(u);
     CHECK_INPUT(y);
 
     auto scalar_type = k.scalar_type();
     TORCH_CHECK(q.scalar_type() == scalar_type, "q type mismatch");
     TORCH_CHECK(v.scalar_type() == scalar_type, "v type mismatch");
     TORCH_CHECK(beta.scalar_type() == scalar_type, "beta type mismatch");
-    TORCH_CHECK(w.scalar_type() == scalar_type, "w type mismatch");
-    TORCH_CHECK(u.scalar_type() == scalar_type, "u type mismatch");
     TORCH_CHECK(y.scalar_type() == scalar_type, "y type mismatch");
 
     auto batch  = k.size(0);
@@ -791,7 +779,7 @@ forward(
         delta_forward_kernel<H, T, D, ACCUM, kHeight, kWidth*kWidthGroups, kWidth, kWidthGroups, kNumWarps, kChunkSize><<<blocks,threads,mem_size>>>( \
             (int)num_chunks, \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
-            w.data_ptr<H>(), u.data_ptr<H>(), y.data_ptr<H>())
+            y.data_ptr<H>())
 
     DISPATCH_ME(d, seqlen);
 #undef DELTA_DISPATCH
@@ -803,7 +791,7 @@ backward(
     torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tensor d_out_y,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
     torch::Tensor d_q, torch::Tensor d_k, torch::Tensor d_v, torch::Tensor d_beta,
-    torch::Tensor w, torch::Tensor u, torch::Tensor y
+    torch::Tensor u
 ) {
     CHECK_INPUT(d_out_w);
     CHECK_INPUT(d_out_u);
@@ -815,9 +803,7 @@ backward(
     CHECK_INPUT(d_k);
     CHECK_INPUT(d_v);
     CHECK_INPUT(d_beta);
-    CHECK_INPUT(w);
     CHECK_INPUT(u);
-    CHECK_INPUT(y);
 
     auto scalar_type = d_out_w.scalar_type();
     TORCH_CHECK(d_out_u.scalar_type() == scalar_type, "d_out_u type mismatch");
@@ -829,9 +815,7 @@ backward(
     TORCH_CHECK(d_k.scalar_type() == scalar_type, "d_k type mismatch");
     TORCH_CHECK(d_v.scalar_type() == scalar_type, "d_v type mismatch");
     TORCH_CHECK(d_beta.scalar_type() == scalar_type, "d_beta type mismatch");
-    TORCH_CHECK(w.scalar_type() == scalar_type, "w type mismatch");
     TORCH_CHECK(u.scalar_type() == scalar_type, "u type mismatch");
-    TORCH_CHECK(y.scalar_type() == scalar_type, "y type mismatch");
 
     auto batch_head = k.size(0);
     auto seqlen = k.size(1);
@@ -860,7 +844,7 @@ backward(
             d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(), d_out_y.data_ptr<H>(), \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             d_q.data_ptr<H>(), d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \
-            w.data_ptr<H>(), u.data_ptr<H>(), y.data_ptr<H>())
+            u.data_ptr<H>())
 
     DISPATCH_ME_FLAT(d, seqlen);
 #undef DELTA_DISPATCH
