@@ -316,7 +316,7 @@ __device__ static inline void chunk_backward(
         kernel(qk, d_y, tk);
         make_causal(qk, qk, 0);
 
-        // d_q-
+        // d_q
         attend(d_q, qk, k);
         reverse_query(tk, d_y, state);
         sub(d_q, d_q, tk);
@@ -451,57 +451,52 @@ __global__ void delta_backward_kernel(
         }
 
         /*
-         * load q, k, v, beta, d_y
+         * load k, v, beta
          */
 
-        load(q, _q + chunk*q.num_elements, q.cols);
-        load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols); // k = k.clone()
-        load(v_reg, _v + chunk*v_reg.num_elements, v_reg.cols); // v = v.clone()
-        load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
-        load(d_y, _d_out_y + chunk*d_y.num_elements, d_y.cols);
+        load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols);
+        load(v_reg, _v + chunk*v_reg.num_elements, v_reg.cols);
+        load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM);
 
         /*
          * decay_values_forward: compute w and u
          */
 
         decay_values_forward(tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg);
-        copy(u_predecay_reg, u_reg); // chunk_forward_nooutput will mutate u_reg
 
         barrier &forward_self = batons[warpid];
         barrier &forward_next = chunk == num_chunks - 1 ? backward_batons[warpid] : batons[(warpid + 1) % kNumWarps];
 
+        copy(u_predecay_reg, u_reg); // chunk_forward_nooutput will mutate u_reg
         chunk_forward_nooutput(shared_state, mma_state, k_reg, w_reg, u_reg, chunk, forward_self, forward_next);
         store(_u + chunk*u_reg.num_elements, u_reg, u_reg.cols); // store decayed u
-    // }
+    }
 
-    // for (int time_block = time_blocks - 1; time_block >= 0; time_block--) {
-    //     const int chunk = time_block * kNumWarps + warpid;
-    //     if (chunk >= num_chunks) {
-    //         break;
-    //     }
-    //     printf("backward chunk=%d time_blocks=%d\n", chunk, time_blocks);
+    for (int time_block = time_blocks - 1; time_block >= 0; time_block--) {
+        const int chunk = time_block * kNumWarps + warpid;
+        if (chunk >= num_chunks) {
+            continue;
+        }
 
-    //     //if (time_block < time_blocks - 1) {
-    //     if (1) {
-    //         // reload everything
-    //         load(q, _q + chunk*q.num_elements, q.cols);
-    //         load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols); // k = k.clone()
-    //         load(v_reg, _v + chunk*v_reg.num_elements, v_reg.cols); // v = v.clone()
-    //         load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
-    //         load(d_y, _d_out_y + chunk*d_y.num_elements, d_y.cols);
+        if (time_block < time_blocks - 1) {
+            // reload
+            load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols); // k = k.clone()
+            load(v_reg, _v + chunk*v_reg.num_elements, v_reg.cols); // v = v.clone()
+            load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
 
-    //         // recompute w_reg and u_reg
-    //         decay_values_forward(tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg);
-    //         copy(u_predecay_reg, u_reg); // XXX: chunk_forward_nooutput will mutate u_reg
-    //         // XXX: u_reg is now "clean"
+            // recompute w_reg and u_reg
+            decay_values_forward(tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg);
+            copy(u_predecay_reg, u_reg); // load will mutate u_reg
 
-    //         // query(u_old, state, w); // state is previous state that we have not computed yet
-    //         // sub(u, u, u_old);
-    //         load(u_reg, _u + chunk*u_reg.num_elements, u_reg.cols);
-    //     }
+            load(u_reg, _u + chunk*u_reg.num_elements, u_reg.cols);
+        }
+
+        load(q, _q + chunk*q.num_elements, q.cols);
+        load(d_y, _d_out_y + chunk*d_y.num_elements, d_y.cols);
 
         barrier &backward_self = backward_batons[warpid];
-        barrier &backward_prev = backward_batons[(warpid - 1) % kNumWarps];
+        const int previous = ((warpid - 1) % kNumWarps + kNumWarps) % kNumWarps;
+        barrier &backward_prev = backward_batons[previous];
 
         chunk_backward(
             q, k_reg, w_reg, u_reg, d_y,
@@ -511,11 +506,7 @@ __global__ void delta_backward_kernel(
             backward_self, backward_prev
         );
 
-        /*
-         * from now on, u_reg is decayed
-         */
-
-        copy(u_reg, u_predecay_reg);
+        copy(u_reg, u_predecay_reg); // restore non-decayed u
 
         rt<D, _time, _key, ducks::rt_layout::col> &q_reg = swap_layout_inplace(q);
         decay_values_backward<T, D, ACCUM, _time, _key, _value>(
@@ -724,7 +715,7 @@ __device__ static inline void decay_values_backward(
 
 #define DISPATCH_ME(d, seqlen) \
     if (d == 16) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1, 16)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1, 8)); \
     } else if (d == 32) { \
         TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1, 8)); \
     } else if (d == 64) { \

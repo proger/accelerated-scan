@@ -71,57 +71,10 @@ def decay_values(q, k, v, beta, chunk_size=2):
     w = beta__ * k_.clone()
     u = beta__ * v_.clone()
     K = einsum('nsd,ntd->nst', k_, k_) # (chunk_size,chunk_size) matrix
-    K = K.tril(diagonal=-1)
-
-    bKl = einsum('ns,nst->nst', beta_, K)
-    bKlT = einsum('nst->nts', bKl)
-
-    # for t in range(1,chunk_size):
-    #     w[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, t, :t], w[:, :t].clone())
-    #     u[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, t, :t], u[:, :t].clone())
-
-    def mul_row(c, m):
-        "multiply every row of m with its corresponding c"
-        #return einsum('nt,ntd->ntd', c, m)
-        return einsum('ntI,ntd->ntd', c, m)
-
-    def col_sum(m):
-        "sum all columns into one row"
-        #return m.sum(-2)
-        return m.sum(-2, keepdim=True)
-
-    def row_sum(m):
-        "sum all rows into one column"
-        #return m.sum(-1)
-        return m.sum(-1, keepdim=True)
-
-    def col_select(x, t):
-        x = x.clone()
-        x[:, :, :t] = 0
-        x[:, :, t+1:] = 0
-        c = row_sum(x)
-        return c
-
-    def add(zero_tile, row_vector):
-        return zero_tile + row_vector
 
     for t in range(1,chunk_size):
-        col = col_select(bKlT, t) # this is a col vector
-
-        decay_w_all = mul_row(col, w.clone())
-        decay_w = col_sum(decay_w_all) # this is a row vector
-
-        decay_u_all = mul_row(col, u.clone())
-        decay_u = col_sum(decay_u_all) # this is a row vector
-
-        z = torch.zeros_like(w)
-        z = add(z, decay_w)
-        
-        w[:, t] = w[:, t] - z[:, t]
-
-        z = torch.zeros_like(w)
-        z = add(z, decay_u)
-        u[:, t] = u[:, t] - z[:, t]
+        w[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, :t, t], w[:, :t].clone())
+        u[:, t] -= beta__[:, t] * einsum('nt,ntd->nd', K[:, :t, t], u[:, :t].clone())
 
     # attend to decayed values
     qk = einsum("nsk,ntk->nst", q_, k_)
@@ -403,56 +356,41 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
     tk = k.new_zeros(NH, chunk_size, D)
 
     # materialize the state for the leading chunk
+    state = einsum('ntv,ntk->nvk', u[:, 0], k_[:, 0])
 
     # stitch forward
-    for c in range(C):
-        k_c = k_[:, c] # load
-        w_c = w[:, c] # load
-        u_c = u[:, c] # load
+    for c in range(1, C):
+        tk = einsum('nvk,ntk->ntv', state, w[:, c])
+        u[:, c] = u[:, c] - tk
+        state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
+        if c < C-1:
+            state = state + state_delta # walk the state forwards
 
-        tk = einsum('nvk,ntk->ntv', state, w_c)
-
-        if c > 0:
-            d_y_delta_c = d_y_delta[:, c] # load
-            d_y_delta_c = -d_y_delta_c # neg
-  
-            # d_q, d_k
-            qk = einsum('nsv,ntv->nst', d_y_delta_c, tk)
-            qk.tril_()
-
-            # d_q
-            tk = einsum('nst,ntk->nsk', qk, k_c) # causal_attend_backward for delta
-            tk.sub_(einsum('nsv,nvk->nsk', d_y_delta_c, state)) # prev_output
-            d_q_[:, c] = tk
-
-
-        delta_value = u_c - tk
-        state_delta = einsum('ntv,ntk->nvk', delta_value, k_c)
-        state = state + state_delta # walk the state forwards
-        u[:, c] = delta_value # global store
+    # from now on, u's are decayed
 
     # stitch backward
     for c in range(C-1, 0, -1):
-        delta_value = u[:, c] # load u
-        k_c = k_[:, c] # load k
-        d_y_delta_c = d_y_delta[:, c] # load d_y_delta
-        w_c = w[:, c] # load w
-        q_c = q_[:, c] # load q
-        
+        if c < C-1:
+            state_delta = einsum('ntv,ntk->nvk', u[:, c], k_[:, c])
+            state = state - state_delta # uncompute the state backwards
+            tk = einsum('nvk,ntk->ntv', state, w[:, c]) # state_decay
+
+        d_y_delta_c = d_y_delta[:, c]
         d_y_delta_c = -d_y_delta_c # neg
-        
-        state_delta = einsum('ntv,ntk->nvk', delta_value, k_c)
-        state = state - state_delta # uncompute the state backwards
-        tk = einsum('nvk,ntk->ntv', state, w_c) # state_decay
 
         # d_q, d_k
         qk = einsum('nsv,ntv->nst', d_y_delta_c, tk)
         qk.tril_()
 
+        # d_q
+        tk = einsum('nst,ntk->nsk', qk, k_[:, c]) # causal_attend_backward for delta
+        tk.sub_(einsum('nsv,nvk->nsk', d_y_delta_c, state)) # prev_output
+        d_q_[:, c] = tk
+
         # d_k
-        tk = einsum('nst,nsk->ntk', qk, q_c)
+        tk = einsum('nst,nsk->ntk', qk, q_[:, c])
         if c < C-1:
-            tk.add_(einsum('nvk,ntv->ntk', d_state, delta_value)) # state_add
+            tk.add_(einsum('nvk,ntv->ntk', d_state, u[:, c])) # state_add
         else:
             # d_state is zero
             pass
@@ -460,25 +398,25 @@ def stitch_backward(d_y_delta, q, k, w, u, C, chunk_size):
 
         # d_u
         if c < C-1:
-            d_u[:, c] = einsum('nvk,ntk->ntv', d_state, k_c) # state_add
+            d_u[:, c] = einsum('nvk,ntk->ntv', d_state, k_[:, c]) # state_add
         else:
             # d_state is zero
             pass
 
         # d_state_decays
-        qk = einsum('nsk,ntk->nst', q_c, k_c)
+        qk = einsum('nsk,ntk->nst', q_[:, c], k_[:, c])
         qk.tril_()
         d_state_decays = einsum('nsv,nst->ntv', d_y_delta_c, qk)
         if c < C-1:
-            d_state_decays.sub_(einsum('nvk,ntk->ntv', d_state, k_c)) # state_add
+            d_state_decays.sub_(einsum('nvk,ntk->ntv', d_state, k_[:, c])) # state_add
 
         # d_w
         tk = einsum('ntv,nvk->ntk', d_state_decays, state)
         d_w[:, c] = tk # state_decays
 
         # backpropagate through time
-        d_state.sub_(einsum('nsv,nsk->nvk', d_y_delta_c, q_c)) # prev_output
-        d_state.add_(einsum('ntv,ntk->nvk', d_state_decays, w_c)) # state_decays
+        d_state.sub_(einsum('nsv,nsk->nvk', d_y_delta_c, q_[:, c])) # prev_output
+        d_state.add_(einsum('ntv,ntk->nvk', d_state_decays, w[:, c])) # state_decays
 
     tk = einsum('nvk,ntk->ntv', d_state, k_[:, 0])
     d_u[:, 0] = tk # state_add
@@ -508,11 +446,11 @@ class Delta(torch.autograd.Function):
 
 
 def test_delta():
-    NH, T, D = 1, 32, 16
+    NH, T, D = 1, 64, 16
     q1, k1, v1, beta1 = make_example(NH, T, D)
 
     y0 = forward_loop(q1, k1, v1, beta1)
-    chunk_size = 16
+    chunk_size = 8
     
     w1, u1, y1 = forward(q1, k1, v1, beta1, chunk_size=chunk_size)
     (y1 - torch.ones_like(y1).detach()).pow(2).mean().backward()
