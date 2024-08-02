@@ -210,8 +210,6 @@ __device__ static inline void chunk_forward_impl(
         // wait until our state is ready
         auto token = self.arrive();
         self.wait(std::move(token));
-
-        printf("forward chunk=%d\n", chunk);
     }
     __syncwarp();
 
@@ -283,8 +281,6 @@ __device__ static inline void chunk_backward(
         // wait until our state is ready
         auto token = self.arrive();
         self.wait(std::move(token));
-
-        printf("backward chunk=%d\n", chunk);
     }
     __syncwarp();
 
