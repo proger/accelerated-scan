@@ -30,7 +30,7 @@ static __device__ inline void decay_values_forward(
 
     kernel(tt_reg, k_reg, k_reg);
     make_causal(tt_reg, tt_reg, 0);
-    set_diagonal(tt_reg, tt_reg, 0); // tt = tt.tril(diagonal=-1)
+    set_diagonal(tt_reg, tt_reg, 0); // tt = tt.tril(diagnal=-1)
 
     mul_row(bKl_reg, tt_reg, beta_reg); // tt = einsum('nts,nt->nts', tt, beta)
 
@@ -214,6 +214,8 @@ __device__ static inline void chunk_forward_impl(
         // wait until our state is ready
         auto token = self.arrive();
         self.wait(std::move(token));
+
+        printf("forward chunk=%d\n", chunk);
     }
     __syncwarp();
 
@@ -285,6 +287,8 @@ __device__ static inline void chunk_backward(
         // wait until our state is ready
         auto token = self.arrive();
         self.wait(std::move(token));
+
+        printf("backward chunk=%d\n", chunk);
     }
     __syncwarp();
 
@@ -301,7 +305,7 @@ __device__ static inline void chunk_backward(
     } else {
         associate(state_delta, u, k);
         /*
-         * uncompute the state backwards -- take that nonlinear models!
+         * uncompute the state backwards
          */
         sub(state, state, state_delta);
         query(tk, state, w);
@@ -312,7 +316,7 @@ __device__ static inline void chunk_backward(
         kernel(qk, d_y, tk);
         make_causal(qk, qk, 0);
 
-        // d_q
+        // d_q-
         attend(d_q, qk, k);
         reverse_query(tk, d_y, state);
         sub(d_q, d_q, tk);
@@ -353,6 +357,8 @@ __device__ static inline void chunk_backward(
         sub(d_state, d_state, state_buf);
         associate(state_buf, d_state_decays, w);
         add(d_state, d_state, state_buf);
+
+        negate(d_y); // undo
     }
 
     store(shared_state, state);
@@ -438,7 +444,7 @@ __global__ void delta_backward_kernel(
     zero(shared_d_state);
     const int time_blocks = (num_chunks + kNumWarps - 1) / kNumWarps;
 
-    for (int time_block = 0; time_block < 1; time_block++) {
+    for (int time_block = 0; time_block < time_blocks; time_block++) {
         const int chunk = time_block * kNumWarps + warpid;
         if (chunk >= num_chunks) {
             break;
@@ -459,16 +465,44 @@ __global__ void delta_backward_kernel(
          */
 
         decay_values_forward(tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg);
+        copy(u_predecay_reg, u_reg); // chunk_forward_nooutput will mutate u_reg
 
-        copy(u_predecay_reg, u_reg); // XXX: chunk_forward_nooutput will mutate u_reg
-
-        // XXX: for now we assume that num_chunks <= kNumWarps and chunk == warpid
         barrier &forward_self = batons[warpid];
-        barrier &forward_next = chunk == num_chunks - 1 ? backward_batons[chunk] : batons[(warpid + 1) % kNumWarps];
-        barrier &backward_self = backward_batons[warpid];
-        barrier &backward_prev = backward_batons[warpid == 0 ? kNumWarps - 1 : warpid - 1];
+        barrier &forward_next = chunk == num_chunks - 1 ? backward_batons[warpid] : batons[(warpid + 1) % kNumWarps];
 
         chunk_forward_nooutput(shared_state, mma_state, k_reg, w_reg, u_reg, chunk, forward_self, forward_next);
+        store(_u + chunk*u_reg.num_elements, u_reg, u_reg.cols); // store decayed u
+    // }
+
+    // for (int time_block = time_blocks - 1; time_block >= 0; time_block--) {
+    //     const int chunk = time_block * kNumWarps + warpid;
+    //     if (chunk >= num_chunks) {
+    //         break;
+    //     }
+    //     printf("backward chunk=%d time_blocks=%d\n", chunk, time_blocks);
+
+    //     //if (time_block < time_blocks - 1) {
+    //     if (1) {
+    //         // reload everything
+    //         load(q, _q + chunk*q.num_elements, q.cols);
+    //         load(k_reg, _k + chunk*k_reg.num_elements, k_reg.cols); // k = k.clone()
+    //         load(v_reg, _v + chunk*v_reg.num_elements, v_reg.cols); // v = v.clone()
+    //         load(beta_reg, _beta + chunk*beta_reg.outer_dim*TILE_DIM); // beta = beta.clone()
+    //         load(d_y, _d_out_y + chunk*d_y.num_elements, d_y.cols);
+
+    //         // recompute w_reg and u_reg
+    //         decay_values_forward(tt_reg, bKl_reg, k_reg, beta_reg, w_reg, u_reg, v_reg, u_bases_reg, bk_reg);
+    //         copy(u_predecay_reg, u_reg); // XXX: chunk_forward_nooutput will mutate u_reg
+    //         // XXX: u_reg is now "clean"
+
+    //         // query(u_old, state, w); // state is previous state that we have not computed yet
+    //         // sub(u, u, u_old);
+    //         load(u_reg, _u + chunk*u_reg.num_elements, u_reg.cols);
+    //     }
+
+        barrier &backward_self = backward_batons[warpid];
+        barrier &backward_prev = backward_batons[(warpid - 1) % kNumWarps];
+
         chunk_backward(
             q, k_reg, w_reg, u_reg, d_y,
             _d_q, _d_k, _d_out_w, _d_out_u,
@@ -478,19 +512,21 @@ __global__ void delta_backward_kernel(
         );
 
         /*
-        * from now on, u_reg is decayed
-        */
+         * from now on, u_reg is decayed
+         */
 
         copy(u_reg, u_predecay_reg);
 
         rt<D, _time, _key, ducks::rt_layout::col> &q_reg = swap_layout_inplace(q);
         decay_values_backward<T, D, ACCUM, _time, _key, _value>(
-            q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg,
+            q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg, d_y,
             mma_TD, mma_TT,
             _d_out_y, _d_out_u, _d_out_w,
             _d_q, _d_k, _d_v, _d_beta,
             chunk
         );
+
+        swap_layout_inplace(q_reg);
     }
 }
 
@@ -505,6 +541,7 @@ __device__ static inline void decay_values_backward(
     rt<D, _time, _value> &u_bases_reg,
     rt<D, _time, _time> &bKl_reg,
     rv<D, _time, 1> &beta_reg,
+    rt<D, _time, _value> &d_out_y_reg,
     rt<ACCUM, _time, _key> &mma_TD,
     rt<ACCUM, _time, _time> &mma_TT,
     const T *_d_out_y,
@@ -517,7 +554,7 @@ __device__ static inline void decay_values_backward(
     const int chunk
 ) {
     rt<D, _time, _key> w_bases_reg, tk_reg, d_k_reg, d_out_w_reg;
-    rt<D, _time, _value> v_reg, d_out_y_reg;
+    rt<D, _time, _value> v_reg;
     rv<D, _time, 2> d_beta_reg;
 
     attend(w_bases_reg, tt_reg, w_reg);
@@ -529,8 +566,6 @@ __device__ static inline void decay_values_backward(
     /*
      * causal_attend_backward for d_q, d_k_2, d_out_u
      */
-
-    load(d_out_y_reg, _d_out_y + chunk*d_out_y_reg.num_elements, d_out_y_reg.cols); // d_out_y = d_out_y.clone()
 
     kernel(tt_reg, d_out_y_reg, u_reg);
     make_causal(tt_reg, tt_reg, 0); // tt.tril_()
