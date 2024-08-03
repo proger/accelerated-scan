@@ -35,7 +35,7 @@ def test_backward(T, D):
     u1 = v.new_zeros(NH, T, D) # placeholder
     from accelerated_scan import kitten
     kitten.delta_backward(
-        d_out_w.clone(), d_out_u.clone(), d_out_y.clone(),
+        d_out_y.clone(),
         q, k, v, beta,
         d_q1, d_k1, d_v1, d_beta1,
         u1

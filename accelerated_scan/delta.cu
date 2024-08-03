@@ -256,10 +256,10 @@ __device__ static inline void chunk_backward(
     rt<D, _time, _key> &w, // not needed for chunk 0
     rt<D, _time, _value> &u,
     rt<D, _time, _value> &d_y,
+    rt<D, _time, _key> &d_w,
+    rt<D, _time, _value> &d_u,
     T *_d_q,
     T *_d_k,
-    T *_d_w,
-    T *_d_u,
     const int chunk,
     const int num_chunks,
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
@@ -270,8 +270,7 @@ __device__ static inline void chunk_backward(
     auto laneid = kittens::laneid();
 
     rt<D, _time, _time> qk;
-    rt<D, _time, _value> d_state_decays;
-    rt<D, _time, _value> d_u;
+    rt<D, _time, _value> d_state_decays, d_state_decays_buf;
     rt<D, _time, _key> d_q, d_k;
     rt<D, _time, _key> tk;
     rt<D, _value, _key> state, d_state, state_delta;
@@ -289,8 +288,7 @@ __device__ static inline void chunk_backward(
     load(d_state, shared_d_state);
 
     if (chunk == 0) {
-        query(tk, d_state, k);
-        store(_d_u + chunk*tk.num_elements, tk, tk.cols);
+        query(d_u, d_state, k);
 
         reverse_query(tk, u, d_state);
         store(_d_k + chunk*tk.num_elements, tk, tk.cols);
@@ -325,7 +323,6 @@ __device__ static inline void chunk_backward(
         // d_u
         if (chunk < num_chunks - 1) {
             query(d_u, d_state, k); // otherwise we know d_state is zero
-            store(_d_u + chunk*d_u.num_elements, d_u, d_u.cols);
         }
 
         // d_state_decays
@@ -334,14 +331,12 @@ __device__ static inline void chunk_backward(
 
         reverse_attend(d_state_decays, qk, d_y);
         if (chunk < num_chunks - 1) {
-            auto &d_state_decays_buf = d_u; // alias
             query(d_state_decays_buf, d_state, k);
             sub(d_state_decays, d_state_decays, d_state_decays_buf);
         }
 
         // d_w
-        reverse_query(tk, d_state_decays, state);
-        store(_d_w + chunk*tk.num_elements, tk, tk.cols);
+        reverse_query(d_w, d_state_decays, state);
 
         // backpropagate through time
         auto &state_buf = state_delta; // alias
@@ -366,8 +361,6 @@ __device__ static inline void chunk_backward(
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int kNumWarps = 8, int kChunkSize = 16>
 __global__ void delta_backward_kernel(
     int num_chunks,
-    H* __restrict__ __d_out_w__,
-    H* __restrict__ __d_out_u__,
     const H* __restrict__ __d_out_y__,
     const H* __restrict__ __q__,
     const H* __restrict__ __k__,
@@ -388,9 +381,7 @@ __global__ void delta_backward_kernel(
             *_k = reinterpret_cast<const T *>(__k__) + block_start,
             *_v = reinterpret_cast<const T *>(__v__) + block_start,
             *_beta = reinterpret_cast<const T *>(__beta__) + beta_block_start;
-          T *_d_out_w = reinterpret_cast<T *>(__d_out_w__) + block_start,
-            *_d_out_u = reinterpret_cast<T *>(__d_out_u__) + block_start,
-            *_d_q = reinterpret_cast<T *>(__d_q__) + block_start,
+          T *_d_q = reinterpret_cast<T *>(__d_q__) + block_start,
             *_d_k = reinterpret_cast<T *>(__d_k__) + block_start,
             *_d_v = reinterpret_cast<T *>(__d_v__) + block_start,
             *_d_beta = reinterpret_cast<T *>(__d_beta__) + beta_block_start,
@@ -407,9 +398,9 @@ __global__ void delta_backward_kernel(
      * register allocations
      */
     rt<D, _time, _key> q;
-    rt<D, _time, _key> k_reg;
+    rt<D, _time, _key> k_reg, d_w;
     rt<D, _time, _value> v_reg;
-    rt<D, _time, _value> d_y;
+    rt<D, _time, _value> d_y, d_u;
     typename rt<D, _time, _key>::col_vec beta_reg;
     rt<D, _time, _key> w_reg, bk_reg;
     rt<D, _time, _value> u_reg, u_bases_reg, u_predecay_reg;
@@ -487,8 +478,9 @@ __global__ void delta_backward_kernel(
         barrier &backward_prev = backward_batons[previous];
 
         chunk_backward(
-            q, k_reg, w_reg, u_reg, d_y,
-            _d_q, _d_k, _d_out_w, _d_out_u,
+            q, k_reg, w_reg, u_reg,
+            d_y, d_w, d_u,
+            _d_q, _d_k,
             chunk, num_chunks,
             shared_state, shared_d_state,
             backward_self, backward_prev
@@ -498,9 +490,9 @@ __global__ void delta_backward_kernel(
 
         rt<D, _time, _key, ducks::rt_layout::col> &q_reg = swap_layout_inplace(q);
         decay_values_backward<T, D, ACCUM, _time, _key, _value>(
-            q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg, d_y,
+            q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg, d_y, d_w, d_u,
             mma_TD, mma_TT,
-            _d_out_y, _d_out_u, _d_out_w,
+            _d_out_y,
             _d_q, _d_k, _d_v, _d_beta,
             chunk
         );
@@ -521,11 +513,11 @@ __device__ static inline void decay_values_backward(
     rt<D, _time, _time> &bKl_reg,
     rv<D, _time, 1> &beta_reg,
     rt<D, _time, _value> &d_out_y_reg,
+    rt<D, _time, _key> &d_w_reg,
+    rt<D, _time, _value> &d_u_reg,
     rt<ACCUM, _time, _key> &mma_TD,
     rt<ACCUM, _time, _time> &mma_TT,
     const T *_d_out_y,
-    T *_d_out_u, // read-only 
-    T *_d_out_w, // read-only
     T *_d_q,
     T *_d_k,
     T *_d_v,
@@ -543,7 +535,7 @@ __device__ static inline void decay_values_backward(
     sub(u_bases_reg, u_bases_reg, v_reg);
 
     /*
-     * causal_attend_backward for d_q, d_k_2, d_out_u
+     * causal_attend_backward for d_q, d_k_2, d_u
      */
 
     kernel(tt_reg, d_out_y_reg, u_reg);
@@ -571,18 +563,13 @@ __device__ static inline void decay_values_backward(
     //q_reg = swap_layout_inplace(q_reg_row); // won't need it later
     make_causal(tt_reg, tt_reg, 0); // tt.tril_()
 
-    auto &d_out_u_reg = v_reg;
-    zero(d_out_u_reg);
-    load(d_out_u_reg, _d_out_u + chunk*d_out_u_reg.num_elements, d_out_u_reg.cols); // d_out_u = d_out_u.clone()
-
     reverse_attend(tk_reg, tt_reg, d_out_y_reg); // don't need last swap_layout_inplace of d_out_y_reg
-    add(d_out_u_reg, d_out_u_reg, tk_reg);
+    add(d_u_reg, d_u_reg, tk_reg);
 
     /*
     * backward for d_k, d_v, d_beta
     */
 
-    load(d_out_w_reg, _d_out_w + chunk*d_out_w_reg.num_elements, d_out_w_reg.cols); // d_out_w = d_out_w.clone()
     zero(d_k_reg); // note that we have a part of d_k in global memory now
 
     for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
@@ -593,12 +580,12 @@ __device__ static inline void decay_values_backward(
         // d_k
         zero(mma_TD);
         {
-            kernel(tt_reg, w_reg, d_out_w_reg);
+            kernel(tt_reg, w_reg, d_w_reg);
             reset_trailing_rows(tt_reg, t);
 
             reverse_attend(tt_reg, k_reg_col, mma_TD, true);
 
-            kernel(tt_reg, u_reg, d_out_u_reg);
+            kernel(tt_reg, u_reg, d_u_reg);
             reset_trailing_rows(tt_reg, t);
 
             reverse_attend(tt_reg, k_reg_col, mma_TD, true);
@@ -618,23 +605,23 @@ __device__ static inline void decay_values_backward(
             {
                 zero(mma_TD);
                 {
-                    auto &d_out_w_reg_col = swap_layout_inplace(d_out_w_reg);
-                    mma_AtB(mma_TD, tt_reg_col, d_out_w_reg_col, mma_TD);
-                    d_out_w_reg = swap_layout_inplace(d_out_w_reg_col);
+                    auto &d_w_reg_col = swap_layout_inplace(d_w_reg);
+                    mma_AtB(mma_TD, tt_reg_col, d_w_reg_col, mma_TD);
+                    d_w_reg = swap_layout_inplace(d_w_reg_col);
                     copy(tk_reg, mma_TD);
                 }
 
-                sub(d_out_w_reg, d_out_w_reg, tk_reg);
+                sub(d_w_reg, d_w_reg, tk_reg);
 
                 zero(mma_TD);
                 {
-                    auto &d_out_u_reg_col = swap_layout_inplace(d_out_u_reg);
-                    mma_AtB(mma_TD, tt_reg_col, d_out_u_reg_col, mma_TD);
-                    d_out_u_reg = swap_layout_inplace(d_out_u_reg_col);
+                    auto &d_u_reg_col = swap_layout_inplace(d_u_reg);
+                    mma_AtB(mma_TD, tt_reg_col, d_u_reg_col, mma_TD);
+                    d_u_reg = swap_layout_inplace(d_u_reg_col);
                     copy(tk_reg, mma_TD);
                 }
 
-                sub(d_out_u_reg, d_out_u_reg, tk_reg);
+                sub(d_u_reg, d_u_reg, tk_reg);
             }
 
             tt_reg = swap_layout_inplace(tt_reg_col);
@@ -644,13 +631,13 @@ __device__ static inline void decay_values_backward(
 
     __syncthreads();
 
-    sub(d_k_reg, d_out_w_reg, d_k_reg); // d_k = d_out_w - d_k
+    sub(d_k_reg, d_w_reg, d_k_reg); // d_k = d_w - d_k
     mul_row(d_k_reg, d_k_reg, beta_reg); // d_k = einsum('ntk,nt->ntk', d_k, beta)
 
     // decay w and u
     zero(mma_TT);
-    mma_ABt(mma_TT, d_out_w_reg, w_reg, mma_TT);
-    mma_ABt(mma_TT, d_out_u_reg, u_reg, mma_TT);
+    mma_ABt(mma_TT, d_w_reg, w_reg, mma_TT);
+    mma_ABt(mma_TT, d_u_reg, u_reg, mma_TT);
     copy(tt_reg, mma_TT);
     make_causal(tt_reg, tt_reg, 0);
     set_diagonal(tt_reg, tt_reg, 0);
@@ -670,12 +657,12 @@ __device__ static inline void decay_values_backward(
     store(_d_k + chunk*d_k_reg.num_elements, d_k_reg, d_k_reg.cols);
 
     // d_beta
-    mul(w_bases_reg, w_bases_reg, d_out_w_reg); // w_bases = einsum('ntk,ntk->ntk', w_bases, d_out_w)
-    mul(u_bases_reg, u_bases_reg, d_out_u_reg); // u_bases = einsum('ntw,ntw->ntw', u_bases, d_out_u)
+    mul(w_bases_reg, w_bases_reg, d_w_reg); // w_bases = einsum('ntk,ntk->ntk', w_bases, d_w)
+    mul(u_bases_reg, u_bases_reg, d_u_reg); // u_bases = einsum('ntw,ntw->ntw', u_bases, d_u)
 
-    // d_v using available d_out_u_reg register
-    mul_row(d_out_u_reg, d_out_u_reg, beta_reg);
-    store(_d_v + chunk*d_k_reg.num_elements, d_out_u_reg, d_out_u_reg.cols);
+    // d_v using available d_u_reg register
+    mul_row(d_u_reg, d_u_reg, beta_reg);
+    store(_d_v + chunk*d_k_reg.num_elements, d_u_reg, d_u_reg.cols);
 
     // continue d_beta
     auto &w_bases_col = swap_layout_inplace(w_bases_reg);
@@ -724,9 +711,9 @@ __device__ static inline void decay_values_backward(
     if (d == 16) { \
         TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 1, 8)); \
     } else if (d == 32) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1, 4)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1, 8)); \
     } else if (d == 64) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 2, 2)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 2, 4)); \
     } else if (d == 128) { \
         TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 4, 2)); \
     } else { \
@@ -784,13 +771,11 @@ forward(
 
 void
 backward(
-    torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tensor d_out_y,
+    torch::Tensor d_out_y,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
     torch::Tensor d_q, torch::Tensor d_k, torch::Tensor d_v, torch::Tensor d_beta,
     torch::Tensor u
 ) {
-    CHECK_INPUT(d_out_w);
-    CHECK_INPUT(d_out_u);
     CHECK_INPUT(d_out_y);
     CHECK_INPUT(q);
     CHECK_INPUT(k);
@@ -801,9 +786,7 @@ backward(
     CHECK_INPUT(d_beta);
     CHECK_INPUT(u);
 
-    auto scalar_type = d_out_w.scalar_type();
-    TORCH_CHECK(d_out_u.scalar_type() == scalar_type, "d_out_u type mismatch");
-    TORCH_CHECK(d_out_y.scalar_type() == scalar_type, "d_out_y type mismatch");
+    auto scalar_type = d_out_y.scalar_type();
     TORCH_CHECK(q.scalar_type() == scalar_type, "q type mismatch");
     TORCH_CHECK(k.scalar_type() == scalar_type, "k type mismatch");
     TORCH_CHECK(v.scalar_type() == scalar_type, "v type mismatch");
@@ -837,7 +820,7 @@ backward(
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
         delta_backward_kernel<H, T, D, ACCUM, kHeight, kWidth, kWidth, kNumWarps, kChunkSize><<<batch_head,threads,mem_size>>>( \
             (int)num_chunks, \
-            d_out_w.data_ptr<H>(), d_out_u.data_ptr<H>(), d_out_y.data_ptr<H>(), \
+            d_out_y.data_ptr<H>(), \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             d_q.data_ptr<H>(), d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \
             u.data_ptr<H>())
