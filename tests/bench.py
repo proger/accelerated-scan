@@ -11,7 +11,7 @@ def init(B, C, T, *, device, requires_grad=False):
     return gates, tokens
 
 
-def make_benchmark(plot_name, *, direction, max_exponent=12):
+def make_benchmark(plot_name, *, direction, batch_size=82, dim=64, max_exponent=12):
     return triton.testing.Benchmark(
         x_names=["SEQUENCE_LENGTH"],  # argument names to use as an x-axis for the plot
         #x_vals=[2**i for i in range(7, max_exponent)],
@@ -44,6 +44,8 @@ def make_benchmark(plot_name, *, direction, max_exponent=12):
         plot_name=plot_name,
         args={
             "direction": direction,
+            "dim": dim,
+            "batch_size": batch_size,
         }
     )
 
@@ -56,8 +58,8 @@ def grad2(f, x, y, grad_out):
 from collections import defaultdict
 c = defaultdict(int)
 
-def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward", "backward", "train"] = "forward"):
-    B, H, D, T = 1, 82, 32, SEQUENCE_LENGTH
+def bench(provider, SEQUENCE_LENGTH, device="cuda", batch_size: int = 82, dim: int = 32, direction: Literal["forward", "backward", "train"] = "forward"):
+    B, H, D, T = 1, batch_size, dim, SEQUENCE_LENGTH
     gates, tokens = init(B, H*D, T, device=device, requires_grad=direction=="train")
     outputs = torch.empty_like(tokens)
     grad_outputs = torch.empty_like(tokens)
@@ -211,13 +213,14 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dim", type=int, default=32)
     parser.add_argument("--direction", choices=["forward", "backward", "train", "all"], default="all")
     args = parser.parse_args()
 
     directions = {
-        'forward': make_benchmark("accelerated_scan: forward speed", direction="forward"),
-        'backward': make_benchmark("accelerated_scan: backward speed of (8,1536,seqlen), inference mode", direction="backward"),
-        'train': make_benchmark("accelerated_scan: training speed of (8,1536,seqlen)", direction="train", max_exponent=15),
+        'forward': make_benchmark("accelerated_scan: forward speed", dim=args.dim, direction="forward"),
+        'backward': make_benchmark(f"accelerated_scan: backward speed of (82,{args.dim},seqlen), inference mode", dim=args.dim, direction="backward"),
+        'train': make_benchmark(f"accelerated_scan: training speed of (82,{args.dim},seqlen)", direction="train", dim=args.dim, max_exponent=15),
     }
 
     benchmarks = []
