@@ -292,6 +292,8 @@ __device__ static inline void chunk_backward(
 
         reverse_query(tk, u, d_state);
         store(_d_k + chunk*tk.num_elements, tk, tk.cols);
+
+        zero(d_w);
     } else {
         associate(state_delta, u, k);
         /*
@@ -322,7 +324,10 @@ __device__ static inline void chunk_backward(
 
         // d_u
         if (chunk < num_chunks - 1) {
-            query(d_u, d_state, k); // otherwise we know d_state is zero
+            query(d_u, d_state, k);
+        } else {
+            // otherwise we know d_state is zero
+            zero(d_u);
         }
 
         // d_state_decays

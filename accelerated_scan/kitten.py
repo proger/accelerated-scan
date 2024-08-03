@@ -30,7 +30,7 @@ delta_module = load_inline(
     cpp_sources=["""\
 extern void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
                     torch::Tensor y);
-extern void backward(torch::Tensor d_out_w, torch::Tensor d_out_u, torch::Tensor d_out_y,
+extern void backward(torch::Tensor d_out_y,
                      torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
                      torch::Tensor d_q, torch::Tensor d_k, torch::Tensor d_v, torch::Tensor d_beta,
                      torch::Tensor u);
@@ -94,10 +94,8 @@ class Delta(torch.autograd.Function):
         d_v = v.new_zeros(NH, T, D)
         d_beta = beta.new_zeros(NH, T)
         u = v.new_zeros(NH, T, D) # buffer
-        d_out_w = k.new_zeros(NH, T, D) # placeholder
-        d_out_u = u.new_zeros(NH, T, D) # placeholder
         delta_backward(
-            d_out_w, d_out_u, d_y,
+            d_y,
             q, k, v, beta,
             d_q, d_k, d_v, d_beta,
             u
