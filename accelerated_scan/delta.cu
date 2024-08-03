@@ -256,10 +256,10 @@ __device__ static inline void chunk_backward(
     rt<D, _time, _key> &w, // not needed for chunk 0
     rt<D, _time, _value> &u,
     rt<D, _time, _value> &d_y,
+    rt<D, _time, _key> &d_q,
+    T *_d_k,
     rt<D, _time, _key> &d_w,
     rt<D, _time, _value> &d_u,
-    T *_d_q,
-    T *_d_k,
     const int chunk,
     const int num_chunks,
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state,
@@ -271,7 +271,7 @@ __device__ static inline void chunk_backward(
 
     rt<D, _time, _time> qk;
     rt<D, _time, _value> d_state_decays, d_state_decays_buf;
-    rt<D, _time, _key> d_q, d_k;
+    rt<D, _time, _key> d_k;
     rt<D, _time, _key> tk;
     rt<D, _time, _value> tv;
     rt<D, _value, _key> state, d_state, state_delta;
@@ -295,6 +295,7 @@ __device__ static inline void chunk_backward(
         store(_d_k + chunk*tk.num_elements, tk, tk.cols);
 
         zero(d_w);
+        zero(d_q);
     } else {
         associate(state_delta, u, k);
         /*
@@ -313,7 +314,6 @@ __device__ static inline void chunk_backward(
         attend(d_q, qk, k);
         reverse_query(tk, d_y, state);
         sub(d_q, d_q, tk);
-        store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
 
         // d_k
         reverse_attend(d_k, qk, q);
@@ -395,17 +395,15 @@ __global__ void delta_backward_kernel(
             *_u = reinterpret_cast<T *>(__u__) + block_start;
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
-    
+
     st<T, _value, _key, ducks::st_layout::swizzle> (&shared_states)[2] = al.allocate<st<T, _value, _key, ducks::st_layout::swizzle>, 2>();
-    st<T, _time, _time, ducks::st_layout::swizzle> (&shared_qks)[1] = al.allocate<st<T, _time, _time, ducks::st_layout::swizzle>, 1>();
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_state = shared_states[0];
     st<T, _value, _key, ducks::st_layout::swizzle> &shared_d_state = shared_states[1];
-    st<T, _time, _time, ducks::st_layout::swizzle> &shared_qk = shared_qks[0];
 
     /*
      * register allocations
      */
-    rt<D, _time, _key> q;
+    rt<D, _time, _key> q, d_q;
     rt<D, _time, _key> k_reg, d_w;
     rt<D, _time, _value> v_reg;
     rt<D, _time, _value> d_y, d_u;
@@ -432,7 +430,6 @@ __global__ void delta_backward_kernel(
     }
 
     zero(shared_d_state);
-    zero(shared_qk);
     const int time_blocks = (num_chunks + kNumWarps - 1) / kNumWarps;
 
     for (int time_block = 0; time_block < time_blocks; time_block++) {
@@ -491,8 +488,8 @@ __global__ void delta_backward_kernel(
 
         chunk_backward(
             q, k_reg, w_reg, u_reg,
-            d_y, d_w, d_u,
-            _d_q, _d_k,
+            d_y,
+            d_q, _d_k, d_w, d_u,
             chunk, num_chunks,
             shared_state, shared_d_state,
             backward_self, backward_prev
@@ -502,8 +499,10 @@ __global__ void delta_backward_kernel(
 
         rt<D, _time, _key, ducks::rt_layout::col> &q_reg = swap_layout_inplace(q);
         decay_values_backward<T, D, ACCUM, _time, _key, _value, _value_groups>(
-            q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg, d_y, d_w, d_u,
-            mma_TD, mma_TT, mma_TV, shared_qk,
+            q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg,
+            d_y,
+            d_q, d_w, d_u,
+            mma_TD, mma_TT, mma_TV,
             _d_out_y,
             _d_q, _d_k, _d_v, _d_beta,
             chunk
@@ -525,12 +524,12 @@ __device__ static inline void decay_values_backward(
     rt<D, _time, _time> &bKl_reg,
     rv<D, _time, 1> &beta_reg,
     rt<D, _time, _value> &d_out_y_reg,
+    rt<D, _time, _key> &d_q,
     rt<D, _time, _key> &d_w_reg,
     rt<D, _time, _value> &d_u_reg,
     rt<ACCUM, _time, _key> &mma_TD,
     rt<ACCUM, _time, _time> &mma_TT,
     rt<ACCUM, _time, _value> &mma_TV,
-    st<T, _time, _time, ducks::st_layout::swizzle> &shared_qk,
     const T *_d_out_y,
     T *_d_q,
     T *_d_k,
@@ -544,7 +543,6 @@ __device__ static inline void decay_values_backward(
 
     rt<D, _time, _key> w_bases_reg, tk_reg, d_k_reg, d_out_w_reg;
     rt<D, _time, _value> v_reg, tv_reg;
-    rt<D, _time, _key> d_q;
     rv<D, _time, 2> d_beta_reg;
 
     attend(w_bases_reg, tt_reg, w_reg);
@@ -557,25 +555,16 @@ __device__ static inline void decay_values_backward(
      * causal_attend_backward for d_q, d_k_2, d_u
      */
 
-    if (vg > 0) {
-        kernel(tt_reg, d_out_y_reg, u_reg);
-        store(shared_qk, tt_reg);
-    }
-    __syncthreads();
-    if (vg == 0) {
-        load(tt_reg, shared_qk);
-        copy(mma_TT, tt_reg);
-        mma_ABt(mma_TT, d_out_y_reg, u_reg, mma_TT);
-        copy(tt_reg, mma_TT);
 
-        make_causal(tt_reg, tt_reg, 0); // tt.tril_()
+    // d_q
+    kernel(tt_reg, d_out_y_reg, u_reg);
+    make_causal(tt_reg, tt_reg, 0);
+    attend(tk_reg, tt_reg, k_reg);
+    add(d_q, d_q, tk_reg);
 
-        attend(d_q, tt_reg, k_reg);
-
-        if (1) {
-            load(tk_reg, _d_q + chunk*tk_reg.num_elements, tk_reg.cols);
-            add(d_q, d_q, tk_reg);
-        }
+    if (1 /* lock */) {
+        load(tk_reg, _d_q + chunk*tk_reg.num_elements, tk_reg.cols);
+        add(d_q, d_q, tk_reg);
         store(_d_q + chunk*q_reg.num_elements, d_q, d_q.cols);
     }
 
@@ -849,7 +838,7 @@ backward(
         constexpr int kKey = kWidth * kWidthGroups; \
         auto threads = kNumWarps * kittens::WARP_THREADS; \
         dim3 blocks(kWidthGroups, 1, batch); \
-        unsigned long mem_size = 2*sizeof(st<T, kWidth, kWidth*kWidthGroups, ducks::st_layout::swizzle>) + sizeof(st<T, kHeight, kHeight, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
+        unsigned long mem_size = 2*sizeof(st<T, kWidth, kWidth*kWidthGroups, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
         delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps, kChunkSize><<<blocks,threads,mem_size>>>( \
             (int)num_chunks, \
