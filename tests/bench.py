@@ -127,42 +127,46 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
 
             gates, tokens = init(B, H, T, device=device, requires_grad=direction=="train")
 
-            k = tokens.unsqueeze(-1).expand(B, H, T, D).bfloat16().contiguous()
-            q = torch.ones_like(k).bfloat16().contiguous()
-            v = torch.ones_like(q).bfloat16().contiguous()
+            k = tokens.unsqueeze(-1).expand(B, H, T, D).bfloat16().contiguous().requires_grad_()
+            q = torch.ones_like(k).bfloat16().contiguous().requires_grad_()
+            v = torch.ones_like(q).bfloat16().contiguous().requires_grad_()
             f = gates.float().contiguous()
             o = torch.empty_like(v).bfloat16().contiguous()
+            do = torch.randn_like(o)
             
             match direction:
                 case "forward":
                     scan = lambda: scaled_dot_product_attention(q, k, v, is_causal=True)
                 case "train":
-                    scan = lambda: scaled_dot_product_attention(q, k, v, is_causal=True)
+                    def scan():
+                        grad = torch.autograd.grad(scaled_dot_product_attention(q, k, v), (q, k, v), do)
+                        sum(x.sum().item() for x in grad)
         case "delta":
             print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
             from accelerated_scan.kitten import delta_forward, delta_backward, delta
 
             gates, tokens = init(B, H, T, device=device, requires_grad=direction=="train")
 
-            k = tokens.unsqueeze(-1).expand(B, H, T, D).bfloat16().contiguous()
-            q = torch.ones_like(k).bfloat16().contiguous()
-            v = torch.ones_like(q).bfloat16().contiguous()
+            k = tokens.unsqueeze(-1).expand(B, H, T, D).bfloat16().contiguous().requires_grad_()
+            q = torch.ones_like(k).bfloat16().contiguous().requires_grad_()
+            v = torch.ones_like(q).bfloat16().contiguous().requires_grad_()
             f = gates.bfloat16().contiguous()
             o = torch.empty_like(v).bfloat16().contiguous()
+            do = torch.randn_like(o)
 
-            k = k.view(B*H, T, D)
-            q = q.view(B*H, T, D)
-            v = v.view(B*H, T, D)
-            f = f.view(B*H, T)
-            o = o.view(B*H, T, D)
-            
             match direction:
                 case "forward":
                     def scan():
+                        k = k.view(B*H, T, D)
+                        q = q.view(B*H, T, D)
+                        v = v.view(B*H, T, D)
+                        f = f.view(B*H, T)
+                        o = o.view(B*H, T, D)
                         delta_forward(q, k, v, f, o)
                 case "train":
                     def scan():
-                        delta(q, k, v, f)
+                        grad = torch.autograd.grad(delta(q, k, v, f), (q, k, v, f), do)
+                        sum(x.sum().item() for x in grad)
 
         case "fla":
             print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")
@@ -175,17 +179,23 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
             f = gates.bfloat16().contiguous()
             o = torch.empty_like(v).bfloat16().contiguous()
 
-            k = k.view(B, H, T, D)
-            q = q.view(B, H, T, D)
-            v = v.view(B, H, T, D)
-            f = f.view(B, H, T)
+            k = k.view(B, H, T, D).requires_grad_()
+            q = q.view(B, H, T, D).requires_grad_()
+            v = v.view(B, H, T, D).requires_grad_()
+            f = f.view(B, H, T).requires_grad_()
             o = o.view(B, H, T, D)
+            do = torch.randn_like(o)
             
             match direction:
                 case "forward":
                     def scan():
                         fused_chunk_delta_rule(q, k, v, f, BT=16)
 
+                case "train":
+                    def scan():
+                        y, _ = fused_chunk_delta_rule(q, k, v, f, BT=16)
+                        grad = torch.autograd.grad(y, (q, k, v, f), do)
+                        sum(x.sum().item() for x in grad)
         case _:
             raise ValueError(f"Unknown provider {provider}")
 

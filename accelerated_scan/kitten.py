@@ -69,13 +69,13 @@ class Delta(torch.autograd.Function):
         assert v.is_contiguous()
         assert beta.is_contiguous()
 
+        ctx.save_for_backward(q, k, v, beta)
         q = q.view(NH, T, D)
         k = k.view(NH, T, D)
         v = v.view(NH, T, D)
         beta = beta.view(NH, T)
         y = torch.empty_like(q)
         delta_forward(q, k, v, beta, y)
-        ctx.save_for_backward(q, k, v, beta)
         return y.view(N, H, T, D)
 
     @staticmethod
@@ -84,6 +84,11 @@ class Delta(torch.autograd.Function):
         N, H, T, D = q.shape
         NH = N * H
 
+        d_y = d_y.view(NH, T, D)
+        q = q.view(NH, T, D)
+        k = k.view(NH, T, D)
+        v = v.view(NH, T, D)
+        beta = beta.view(NH, T)
         d_q = q.new_zeros(NH, T, D)
         d_k = k.new_zeros(NH, T, D)
         d_v = v.new_zeros(NH, T, D)

@@ -824,7 +824,7 @@ backward(
     TORCH_CHECK(same, "Q, K and V should be same size");
     constexpr int kChunkSize = 16;
     auto num_chunks = seqlen / kChunkSize;
-    TORCH_CHECK(num_chunks <= 16, "num_chunks should be <= 32 (chunk size is 16)");
+    // TORCH_CHECK(num_chunks <= 16, "num_chunks should be <= 32 (chunk size is 16)");
 
     // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
     // kWidth: tiles per vector, 2 means head dimension is 2*16 = 32
