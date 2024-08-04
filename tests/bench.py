@@ -155,12 +155,7 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", batch_size: int = 82, dim: i
             match direction:
                 case "forward":
                     def scan():
-                        k = k.view(B*H, T, D)
-                        q = q.view(B*H, T, D)
-                        v = v.view(B*H, T, D)
-                        f = f.view(B*H, T)
-                        o = o.view(B*H, T, D)
-                        delta_forward(q, k, v, f, o)
+                        delta(q, k, v, f)
                 case "train":
                     def scan():
                         grad = torch.autograd.grad(delta(q, k, v, f), (q, k, v, f), do)
@@ -217,8 +212,8 @@ if __name__ == '__main__':
 
     directions = {
         'forward': make_benchmark("accelerated_scan: forward speed", dim=args.dim, direction="forward", max_exponent=args.max_exponent, batch_size=args.batch_size),
-        'backward': make_benchmark(f"accelerated_scan: backward speed of (82,{args.dim},seqlen), inference mode", dim=args.dim, direction="backward", max_exponent=args.max_exponent, batch_size=args.batch_size),
-        'train': make_benchmark(f"accelerated_scan: training speed of (82,{args.dim},seqlen)", direction="train", dim=args.dim, max_exponent=args.max_exponent, batch_size=args.batch_size),
+        'backward': make_benchmark(f"accelerated_scan: backward speed of ({args.batch_size},{args.dim},seqlen), inference mode", dim=args.dim, direction="backward", max_exponent=args.max_exponent, batch_size=args.batch_size),
+        'train': make_benchmark(f"accelerated_scan: training speed of ({args.batch_size},{args.dim},seqlen)", direction="train", dim=args.dim, max_exponent=args.max_exponent, batch_size=args.batch_size),
     }
 
     benchmarks = []

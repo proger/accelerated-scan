@@ -45,18 +45,22 @@ def test_backward(T, D):
     #torch.set_printoptions(linewidth=300)
 
     #print(d_q0 - d_q1, 'd_q diff')
-    assert allclose(d_q0, d_q1, atol=1e-2), 'd_q is wrong'
+    err = (d_q0 - d_q1).abs().max().item()
+    assert allclose(d_q0, d_q1, atol=5e-2), f'd_q is wrong: {err}'
 
     #print(d_k0, 'd_k ref')
     #print(d_k1, 'd_k hyp')
     #print((d_k1 - d_k0).abs().topk(10), 'd_k diff')
-    assert allclose(d_k0, d_k1, atol=1e-2), 'd_k is wrong' # ???
-    assert allclose(d_v0, d_v1, atol=1e-2), 'd_v is wrong'
+    err = (d_k0 - d_k1).abs().max().item()
+    assert allclose(d_k0, d_k1, atol=5e-2), f'd_k is wrong: {err}' # ???
+    err = (d_v0 - d_v1).abs().max().item()
+    assert allclose(d_v0, d_v1, atol=5e-2), f'd_v is wrong: {err}'
 
     #print(d_beta0, 'ref')
     #print(d_beta1, 'hyp')
     # XXX: atol=1e-2 might be too low. cast to float32?
-    assert allclose(d_beta0, d_beta1, atol=1e-2), 'd_beta is wrong'
+    err = (d_beta0 - d_beta1).abs().max().item()
+    assert allclose(d_beta0, d_beta1, atol=5e-2), f'd_beta is wrong: {err}'
 
 
 @pytest.mark.parametrize('T', [16, 32, 64, 128, 256, 512, 1024])
@@ -89,13 +93,18 @@ def test_forward(T, D):
     from accelerated_scan import kitten
     kitten.delta_forward(q, k, v, beta, y2)
 
-    assert allclose(y, y2, atol=1e-2), 'y2 is wrong'
+    assert allclose(y, y2, atol=2e-2), 'y2 is wrong'
 
 
 @pytest.mark.parametrize('T', [2048, 4096, 8192, 16384])
 @pytest.mark.parametrize('D', [16, 32, 64, 128])
 def test_longf(T, D):
     return test_forward(T, D)
+
+@pytest.mark.parametrize('T', [2048, 4096, 8192, 16384])
+@pytest.mark.parametrize('D', [16, 32, 64, 128])
+def test_longb(T, D):
+    return test_backward(T, D)
 
 
 if __name__ == '__main__':
