@@ -11,14 +11,10 @@ def init(B, C, T, *, device, requires_grad=False):
     return gates, tokens
 
 
-def make_benchmark(plot_name, *, direction, batch_size=82, dim=64, max_exponent=12):
+def make_benchmark(plot_name, *, direction, batch_size=82, dim=64, max_exponent=15):
     return triton.testing.Benchmark(
         x_names=["SEQUENCE_LENGTH"],  # argument names to use as an x-axis for the plot
-        #x_vals=[2**i for i in range(7, max_exponent)],
-        #x_vals=[512,1024,2048,4096,8192,16384],
-        x_vals=[256,512,1024,2048,4096,8192,16384],
-        #x_vals=[1024],
-        #x_vals=[512,1024,2048,4096,8192,16384],
+        x_vals=[2**i for i in range(8, max_exponent)],
         xlabel='sequence length',
         ylabel='ms',
         x_log=True,
@@ -214,13 +210,15 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--dim", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=82)
+    parser.add_argument("--max-exponent", type=int, default=15)
     parser.add_argument("--direction", choices=["forward", "backward", "train", "all"], default="all")
     args = parser.parse_args()
 
     directions = {
-        'forward': make_benchmark("accelerated_scan: forward speed", dim=args.dim, direction="forward"),
-        'backward': make_benchmark(f"accelerated_scan: backward speed of (82,{args.dim},seqlen), inference mode", dim=args.dim, direction="backward"),
-        'train': make_benchmark(f"accelerated_scan: training speed of (82,{args.dim},seqlen)", direction="train", dim=args.dim, max_exponent=15),
+        'forward': make_benchmark("accelerated_scan: forward speed", dim=args.dim, direction="forward", max_exponent=args.max_exponent, batch_size=args.batch_size),
+        'backward': make_benchmark(f"accelerated_scan: backward speed of (82,{args.dim},seqlen), inference mode", dim=args.dim, direction="backward", max_exponent=args.max_exponent, batch_size=args.batch_size),
+        'train': make_benchmark(f"accelerated_scan: training speed of (82,{args.dim},seqlen)", direction="train", dim=args.dim, max_exponent=args.max_exponent, batch_size=args.batch_size),
     }
 
     benchmarks = []
