@@ -1,5 +1,8 @@
 #include <cooperative_groups.h>
 #include <cuda/barrier>
+#include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
+
 #include "algebra.cu"
 
 using namespace kittens; // this kernel only handles headdim=q_reg.cols for simplicity. Also n should be a multiple of 256 here.
@@ -257,7 +260,7 @@ __device__ static inline void chunk_backward(
     rt<D, _time, _value> &u,
     rt<D, _time, _value> &d_y,
     rt<D, _time, _key> &d_q,
-    T *_d_k,
+    rt<D, _time, _key> &d_k,
     rt<D, _time, _key> &d_w,
     rt<D, _time, _value> &d_u,
     const int chunk,
@@ -271,7 +274,6 @@ __device__ static inline void chunk_backward(
 
     rt<D, _time, _time> qk;
     rt<D, _time, _value> d_state_decays, d_state_decays_buf;
-    rt<D, _time, _key> d_k;
     rt<D, _time, _key> tk;
     rt<D, _time, _value> tv;
     rt<D, _value, _key> state, d_state, state_delta;
@@ -289,13 +291,10 @@ __device__ static inline void chunk_backward(
     load(d_state, shared_d_state);
 
     if (chunk == 0) {
-        query(d_u, d_state, k);
-
-        reverse_query(tk, u, d_state);
-        store(_d_k + chunk*tk.num_elements, tk, tk.cols);
-
-        zero(d_w);
         zero(d_q);
+        reverse_query(d_k, u, d_state);
+        zero(d_w);
+        query(d_u, d_state, k);
     } else {
         associate(state_delta, u, k);
         /*
@@ -321,7 +320,6 @@ __device__ static inline void chunk_backward(
             reverse_query(tk, u, d_state); // otherwise we know d_state is zero
             add(d_k, d_k, tk);
         }
-        store(_d_k + chunk*d_k.num_elements, d_k, d_k.cols);
 
         // d_u
         if (chunk < num_chunks - 1) {
@@ -364,35 +362,41 @@ __device__ static inline void chunk_backward(
     __syncwarp();
 }
 
+
+template <typename H>
+struct DeltaBackwardArgs {
+    unsigned long long num_chunks;
+    const H* __restrict__ __d_out_y__;
+    const H* __restrict__ __q__;
+    const H* __restrict__ __k__;
+    const H* __restrict__ __v__;
+    const H* __restrict__ __beta__;
+    H* __restrict__ __d_q__;
+    H* __restrict__ __d_k__;
+    H* __restrict__ __d_v__;
+    H* __restrict__ __d_beta__;
+    H* __restrict__ __u__;
+    unsigned long long* __locks__;
+};
+
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int _value_groups, int kNumWarps = 8, int kChunkSize = 16>
-__global__ void delta_backward_kernel(
-    int num_chunks,
-    const H* __restrict__ __d_out_y__,
-    const H* __restrict__ __q__,
-    const H* __restrict__ __k__,
-    const H* __restrict__ __v__,
-    const H* __restrict__ __beta__,
-    H* __restrict__ __d_q__,
-    H* __restrict__ __d_k__,
-    H* __restrict__ __d_v__,
-    H* __restrict__ __d_beta__,
-    H* __restrict__ __u__
-) {
+__global__ void delta_backward_kernel(DeltaBackwardArgs<H> args) {
+    const int num_chunks = args.num_chunks;
     auto warpid           = kittens::warpid();
     auto laneid           = kittens::laneid();
     auto vg               = blockIdx.x % _value_groups;
     auto block_start      = blockIdx.z*(num_chunks*kChunkSize*(_key*TILE_DIM));
     auto beta_block_start = blockIdx.z*(num_chunks*kChunkSize*1); // width is 1 for beta
-    const T *_d_out_y = reinterpret_cast<const T *>(__d_out_y__) + block_start,
-            *_q = reinterpret_cast<const T *>(__q__) + block_start,
-            *_k = reinterpret_cast<const T *>(__k__) + block_start,
-            *_v = reinterpret_cast<const T *>(__v__) + block_start,
-            *_beta = reinterpret_cast<const T *>(__beta__) + beta_block_start;
-          T *_d_q = reinterpret_cast<T *>(__d_q__) + block_start,
-            *_d_k = reinterpret_cast<T *>(__d_k__) + block_start,
-            *_d_v = reinterpret_cast<T *>(__d_v__) + block_start,
-            *_d_beta = reinterpret_cast<T *>(__d_beta__) + beta_block_start,
-            *_u = reinterpret_cast<T *>(__u__) + block_start;
+    const T *_d_out_y = reinterpret_cast<const T *>(args.__d_out_y__) + block_start,
+            *_q = reinterpret_cast<const T *>(args.__q__) + block_start,
+            *_k = reinterpret_cast<const T *>(args.__k__) + block_start,
+            *_v = reinterpret_cast<const T *>(args.__v__) + block_start,
+            *_beta = reinterpret_cast<const T *>(args.__beta__) + beta_block_start;
+          T *_d_q = reinterpret_cast<T *>(args.__d_q__) + block_start,
+            *_d_k = reinterpret_cast<T *>(args.__d_k__) + block_start,
+            *_d_v = reinterpret_cast<T *>(args.__d_v__) + block_start,
+            *_d_beta = reinterpret_cast<T *>(args.__d_beta__) + beta_block_start,
+            *_u = reinterpret_cast<T *>(args.__u__) + block_start;
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
 
@@ -404,7 +408,7 @@ __global__ void delta_backward_kernel(
      * register allocations
      */
     rt<D, _time, _key> q, d_q;
-    rt<D, _time, _key> k_reg, d_w;
+    rt<D, _time, _key> k_reg, d_w, d_k;
     rt<D, _time, _value> v_reg;
     rt<D, _time, _value> d_y, d_u;
     typename rt<D, _time, _key>::col_vec beta_reg;
@@ -489,7 +493,7 @@ __global__ void delta_backward_kernel(
         chunk_backward(
             q, k_reg, w_reg, u_reg,
             d_y,
-            d_q, _d_k, d_w, d_u,
+            d_q, d_k, d_w, d_u,
             chunk, num_chunks,
             shared_state, shared_d_state,
             backward_self, backward_prev
@@ -498,10 +502,10 @@ __global__ void delta_backward_kernel(
         copy(u_reg, u_predecay_reg); // restore non-decayed u
 
         rt<D, _time, _key, ducks::rt_layout::col> &q_reg = swap_layout_inplace(q);
-        decay_values_backward<T, D, ACCUM, _time, _key, _value, _value_groups>(
+        decay_values_backward<T, D, ACCUM, _time, _key, _value, _value_groups, kNumWarps>(
             q_reg, k_reg, w_reg, tt_reg, bk_reg, u_reg, u_bases_reg, bKl_reg, beta_reg,
             d_y,
-            d_q, d_w, d_u,
+            d_q, d_k, d_w, d_u,
             mma_TD, mma_TT, mma_TV,
             _d_out_y,
             _d_q, _d_k, _d_v, _d_beta,
@@ -512,7 +516,7 @@ __global__ void delta_backward_kernel(
     }
 }
 
-template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int _value_groups>
+template <typename T, typename D, typename ACCUM, int _time, int _key, int _value, int _value_groups, int kNumWarps>
 __device__ static inline void decay_values_backward(
     rt<D, _time, _key, ducks::rt_layout::col> &q_reg,
     rt<D, _time, _key> &k_reg,
@@ -525,6 +529,7 @@ __device__ static inline void decay_values_backward(
     rv<D, _time, 1> &beta_reg,
     rt<D, _time, _value> &d_out_y_reg,
     rt<D, _time, _key> &d_q,
+    rt<D, _time, _key> &d_k,
     rt<D, _time, _key> &d_w_reg,
     rt<D, _time, _value> &d_u_reg,
     rt<ACCUM, _time, _key> &mma_TD,
@@ -544,6 +549,7 @@ __device__ static inline void decay_values_backward(
     rt<D, _time, _key> w_bases_reg, tk_reg, d_k_reg, d_out_w_reg;
     rt<D, _time, _value> v_reg, tv_reg;
     rv<D, _time, 2> d_beta_reg;
+    rv<D, _time, 2> d_beta_buf_reg;
 
     attend(w_bases_reg, tt_reg, w_reg);
     sub(w_bases_reg, k_reg, w_bases_reg);
@@ -562,19 +568,24 @@ __device__ static inline void decay_values_backward(
     attend(tk_reg, tt_reg, k_reg);
     add(d_q, d_q, tk_reg);
 
-    if (1 /* lock */) {
-        load(tk_reg, _d_q + chunk*tk_reg.num_elements, tk_reg.cols);
-        add(d_q, d_q, tk_reg);
-        store(_d_q + chunk*q_reg.num_elements, d_q, d_q.cols);
+    auto g = cooperative_groups::this_grid();
+
+    {
+        #pragma unroll
+        for (int vchunk = 0; vchunk < _value_groups; vchunk++) {
+            if (vg == vchunk) {
+                load(tk_reg, _d_q + chunk*tk_reg.num_elements, tk_reg.cols);
+                add(d_q, d_q, tk_reg);
+                store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
+            }
+            g.sync();
+        }
     }
+
+    // d_k
 
     reverse_attend(d_k_reg, tt_reg, q_reg);
-
-    if (1) {
-        load(tk_reg, _d_k + chunk*tk_reg.num_elements, tk_reg.cols);
-        add(d_k_reg, d_k_reg, tk_reg);
-    }
-    store(_d_k + chunk*d_k_reg.num_elements, d_k_reg, d_k_reg.cols); // first part of d_k
+    add(d_k, d_k, d_k_reg);
 
     auto &q_reg_row = swap_layout_inplace(q_reg);
     kernel(tt_reg, q_reg_row, k_reg);
@@ -588,7 +599,7 @@ __device__ static inline void decay_values_backward(
     * backward for d_k, d_v, d_beta
     */
 
-    zero(d_k_reg); // note that we have a part of d_k in global memory now
+    zero(d_k_reg);
 
     for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
         __syncthreads();
@@ -668,11 +679,19 @@ __device__ static inline void decay_values_backward(
         copy(tk_reg, mma_TD);
     }
     sub(d_k_reg, d_k_reg, tk_reg);
+    add(d_k, d_k, d_k_reg);
 
-    load(tk_reg, _d_k + chunk*d_k_reg.num_elements, d_k_reg.cols); // d_k = d_k.clone()
-    __syncthreads();
-    add(d_k_reg, d_k_reg, tk_reg); // d_k += tk, reload from global memory
-    store(_d_k + chunk*d_k_reg.num_elements, d_k_reg, d_k_reg.cols);
+    {
+        #pragma unroll
+        for (int vchunk = 0; vchunk < _value_groups; vchunk++) {
+            if (vg == vchunk) {
+                load(tk_reg, _d_k + chunk*d_k.num_elements, d_k.cols);
+                add(d_k, d_k, tk_reg);
+                store(_d_k + chunk*d_k.num_elements, d_k, d_k.cols);
+            }
+            g.sync();
+        }
+    }
 
     // d_beta
     mul(w_bases_reg, w_bases_reg, d_w_reg); // w_bases = einsum('ntk,ntk->ntk', w_bases, d_w)
@@ -688,7 +707,18 @@ __device__ static inline void decay_values_backward(
     zero(d_beta_reg);
     row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
     row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
-    store(_d_beta + chunk*beta_reg.outer_dim*TILE_DIM, d_beta_reg);
+
+    {
+        #pragma unroll
+        for (int vchunk = 0; vchunk < _value_groups; vchunk++) {
+            if (vg == vchunk) {
+                load(d_beta_buf_reg, _d_beta + chunk*beta_reg.outer_dim*TILE_DIM);
+                add(d_beta_reg, d_beta_reg, d_beta_buf_reg);
+                store(_d_beta + chunk*beta_reg.outer_dim*TILE_DIM, d_beta_reg);
+            }
+            g.sync();
+        }
+    }
 }
 
 // see also: DISPATCH
@@ -825,7 +855,7 @@ backward(
     }
     TORCH_CHECK(same, "Q, K and V should be same size");
     constexpr int kChunkSize = 16;
-    auto num_chunks = seqlen / kChunkSize;
+    unsigned long long num_chunks = seqlen / kChunkSize;
     // TORCH_CHECK(num_chunks <= 16, "num_chunks should be <= 32 (chunk size is 16)");
 
     // kHeight: tiles per sequence block, 2 means 2*16 = 32 sequence elements per warp
@@ -836,16 +866,23 @@ backward(
         constexpr int kWidthGroups = _kWidthGroups; \
         constexpr int kNumWarps = _kNumWarps; \
         constexpr int kKey = kWidth * kWidthGroups; \
+        unsigned long long *locks; \
+        cudaMalloc(&locks, batch * kNumWarps * sizeof(unsigned long long)); \
+        cudaMemset(locks, 0, batch * kNumWarps * sizeof(unsigned long long)); \
         auto threads = kNumWarps * kittens::WARP_THREADS; \
-        dim3 blocks(kWidthGroups, 1, batch); \
-        unsigned long mem_size = 2*sizeof(st<T, kWidth, kWidth*kWidthGroups, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
+        dim3 gridDim(kWidthGroups, 1, batch); \
+        dim3 blockDim(threads, 1, 1); \
+        size_t mem_size = 2*sizeof(st<T, kWidth, kWidth*kWidthGroups, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
+        auto kernel = delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>; \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
-        delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps, kChunkSize><<<blocks,threads,mem_size>>>( \
-            (int)num_chunks, \
+        DeltaBackwardArgs<H> args = {num_chunks, \
             d_out_y.data_ptr<H>(), \
             q.data_ptr<H>(), k.data_ptr<H>(), v.data_ptr<H>(), beta.data_ptr<H>(), \
             d_q.data_ptr<H>(), d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \
-            u.data_ptr<H>())
+            u.data_ptr<H>(), locks}; \
+        void *args_ptr[] = {&args}; \
+        cudaLaunchCooperativeKernel((const void *)&delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>, gridDim, blockDim, args_ptr, mem_size, at::cuda::getCurrentCUDAStream().stream()); \
+        cudaFree(locks)
 
     DISPATCH_ME_FLAT(d, seqlen);
 #undef DELTA_DISPATCH
