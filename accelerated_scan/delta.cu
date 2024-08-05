@@ -376,7 +376,7 @@ struct DeltaBackwardArgs {
     H* __restrict__ __d_v__;
     H* __restrict__ __d_beta__;
     H* __restrict__ __u__;
-    unsigned long long* __locks__;
+    int* __locks__;
 };
 
 template <typename H, typename T, typename D, typename ACCUM, int _time, int _key, int _value, int _value_groups, int kNumWarps = 8, int kChunkSize = 16>
@@ -509,7 +509,8 @@ __global__ void delta_backward_kernel(DeltaBackwardArgs<H> args) {
             mma_TD, mma_TT, mma_TV,
             _d_out_y,
             _d_q, _d_k, _d_v, _d_beta,
-            chunk
+            chunk,
+            args.__locks__
         );
 
         swap_layout_inplace(q_reg);
@@ -540,7 +541,8 @@ __device__ static inline void decay_values_backward(
     T *_d_k,
     T *_d_v,
     T *_d_beta,
-    const int chunk
+    const int chunk,
+    int *locks
 ) {
     auto vg = blockIdx.x % _value_groups;
     constexpr int v_num_elements = u_reg.num_elements * _value_groups;
@@ -568,18 +570,27 @@ __device__ static inline void decay_values_backward(
     attend(tk_reg, tt_reg, k_reg);
     add(d_q, d_q, tk_reg);
 
-    auto g = cooperative_groups::this_grid();
 
-    {
-        #pragma unroll
-        for (int vchunk = 0; vchunk < _value_groups; vchunk++) {
-            if (vg == vchunk) {
-                load(tk_reg, _d_q + chunk*tk_reg.num_elements, tk_reg.cols);
-                add(d_q, d_q, tk_reg);
-                store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
-            }
-            g.sync();
+    if (1) {
+        int *lock = &locks[0*kNumWarps*gridDim.z + blockIdx.z*kNumWarps + kittens::warpid()];
+
+        // lock
+        if (kittens::laneid() == 0) {
+            while (atomicCAS(lock, 0, 1) == 1) {
+                // spin
+            };
         }
+        __syncwarp();
+
+        load(tk_reg, _d_q + chunk*tk_reg.num_elements, tk_reg.cols);
+        add(d_q, d_q, tk_reg);
+        store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
+
+        // unlock
+        if (kittens::laneid() == 0) {
+            atomicExch(lock, 0);
+        }
+        __syncwarp();
     }
 
     // d_k
@@ -602,7 +613,6 @@ __device__ static inline void decay_values_backward(
     zero(d_k_reg);
 
     for (auto t = _time * TILE_DIM - 1; t >= 0; t--) {
-        __syncthreads();
 
         auto &k_reg_col = swap_layout_inplace(k_reg);
 
@@ -658,8 +668,6 @@ __device__ static inline void decay_values_backward(
 
     }
 
-    __syncthreads();
-
     sub(d_k_reg, d_w_reg, d_k_reg); // d_k = d_w - d_k
     mul_row(d_k_reg, d_k_reg, beta_reg); // d_k = einsum('ntk,nt->ntk', d_k, beta)
 
@@ -681,16 +689,26 @@ __device__ static inline void decay_values_backward(
     sub(d_k_reg, d_k_reg, tk_reg);
     add(d_k, d_k, d_k_reg);
 
-    {
-        #pragma unroll
-        for (int vchunk = 0; vchunk < _value_groups; vchunk++) {
-            if (vg == vchunk) {
-                load(tk_reg, _d_k + chunk*d_k.num_elements, d_k.cols);
-                add(d_k, d_k, tk_reg);
-                store(_d_k + chunk*d_k.num_elements, d_k, d_k.cols);
-            }
-            g.sync();
+    if (1) {
+        int *lock = &locks[1*kNumWarps*gridDim.z + blockIdx.z*kNumWarps + kittens::warpid()];
+
+        // lock
+        if (kittens::laneid() == 0) {
+            while (atomicCAS(lock, 0, 1) == 1) {
+                // spin
+            };
         }
+        __syncwarp();
+
+        load(tk_reg, _d_k + chunk*d_k.num_elements, d_k.cols);
+        add(d_k, d_k, tk_reg);
+        store(_d_k + chunk*d_k.num_elements, d_k, d_k.cols);
+
+        // unlock
+        if (kittens::laneid() == 0) {
+            atomicExch(lock, 0);
+        }
+        __syncwarp();
     }
 
     // d_beta
@@ -708,16 +726,26 @@ __device__ static inline void decay_values_backward(
     row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
     row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
 
-    {
-        #pragma unroll
-        for (int vchunk = 0; vchunk < _value_groups; vchunk++) {
-            if (vg == vchunk) {
-                load(d_beta_buf_reg, _d_beta + chunk*beta_reg.outer_dim*TILE_DIM);
-                add(d_beta_reg, d_beta_reg, d_beta_buf_reg);
-                store(_d_beta + chunk*beta_reg.outer_dim*TILE_DIM, d_beta_reg);
-            }
-            g.sync();
+    if (1) {
+        int *lock = &locks[2*kNumWarps*gridDim.z + blockIdx.z*kNumWarps + kittens::warpid()];
+
+        // lock
+        if (kittens::laneid() == 0) {
+            while (atomicCAS(lock, 0, 1) == 1) {
+                // spin
+            };
         }
+        __syncwarp();
+
+        load(d_beta_buf_reg, _d_beta + chunk*beta_reg.outer_dim*TILE_DIM);
+        add(d_beta_reg, d_beta_reg, d_beta_buf_reg);
+        store(_d_beta + chunk*beta_reg.outer_dim*TILE_DIM, d_beta_reg);
+
+        // unlock
+        if (kittens::laneid() == 0) {
+            atomicExch(lock, 0);
+        }
+        __syncwarp();
     }
 }
 
@@ -761,9 +789,9 @@ __device__ static inline void decay_values_backward(
     } else if (d == 32) { \
         TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 1, 8)); \
     } else if (d == 64) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 2, 8)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 2, 4)); \
     } else if (d == 128) { \
-        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 2, 4, 2)); \
+        TYPE_DISPATCH(scalar_type, DELTA_DISPATCH(1, 1, 8, 4)); \
     } else { \
         TORCH_CHECK(false, "[qkv].size(2) should be 16, 32, 64, 128"); \
     }
@@ -866,13 +894,13 @@ backward(
         constexpr int kWidthGroups = _kWidthGroups; \
         constexpr int kNumWarps = _kNumWarps; \
         constexpr int kKey = kWidth * kWidthGroups; \
-        unsigned long long *locks; \
-        cudaMalloc(&locks, batch * kNumWarps * sizeof(unsigned long long)); \
-        cudaMemset(locks, 0, batch * kNumWarps * sizeof(unsigned long long)); \
+        int *locks; \
+        cudaMalloc(&locks, 3 * batch * kNumWarps * sizeof(int)); \
+        cudaMemset(locks, 0, 3 * batch * kNumWarps * sizeof(int)); \
         auto threads = kNumWarps * kittens::WARP_THREADS; \
         dim3 gridDim(kWidthGroups, 1, batch); \
         dim3 blockDim(threads, 1, 1); \
-        size_t mem_size = 2*sizeof(st<T, kWidth, kWidth*kWidthGroups, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
+        size_t mem_size = 2*sizeof(st<T, kWidth, kKey, ducks::st_layout::swizzle>) + 2*kNumWarps*sizeof(barrier); \
         auto kernel = delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>; \
         CHECK_CUDA_ERROR(cudaFuncSetAttribute(delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size)); \
         DeltaBackwardArgs<H> args = {num_chunks, \
@@ -881,7 +909,7 @@ backward(
             d_q.data_ptr<H>(), d_k.data_ptr<H>(), d_v.data_ptr<H>(), d_beta.data_ptr<H>(), \
             u.data_ptr<H>(), locks}; \
         void *args_ptr[] = {&args}; \
-        cudaLaunchCooperativeKernel((const void *)&delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>, gridDim, blockDim, args_ptr, mem_size, at::cuda::getCurrentCUDAStream().stream()); \
+        cudaLaunchKernel((const void *)&delta_backward_kernel<H, T, D, ACCUM, kHeight, kKey, kWidth, kWidthGroups, kNumWarps>, gridDim, blockDim, args_ptr, mem_size, at::cuda::getCurrentCUDAStream().stream()); \
         cudaFree(locks)
 
     DISPATCH_ME_FLAT(d, seqlen);
