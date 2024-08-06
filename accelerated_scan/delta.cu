@@ -571,7 +571,7 @@ __device__ static inline void decay_values_backward(
     add(d_q, d_q, tk_reg);
 
 
-    if (1) {
+    if constexpr (_value_groups > 1) {
         int *lock = &locks[0*kNumWarps*gridDim.z + blockIdx.z*kNumWarps + kittens::warpid()];
 
         // lock
@@ -591,6 +591,8 @@ __device__ static inline void decay_values_backward(
             atomicExch(lock, 0);
         }
         __syncwarp();
+    } else {
+        store(_d_q + chunk*d_q.num_elements, d_q, d_q.cols);
     }
 
     // d_k
@@ -689,7 +691,7 @@ __device__ static inline void decay_values_backward(
     sub(d_k_reg, d_k_reg, tk_reg);
     add(d_k, d_k, d_k_reg);
 
-    if (1) {
+    if constexpr (_value_groups > 1) {
         int *lock = &locks[1*kNumWarps*gridDim.z + blockIdx.z*kNumWarps + kittens::warpid()];
 
         // lock
@@ -709,6 +711,8 @@ __device__ static inline void decay_values_backward(
             atomicExch(lock, 0);
         }
         __syncwarp();
+    } else {
+        store(_d_k + chunk*d_k.num_elements, d_k, d_k.cols);
     }
 
     // d_beta
@@ -726,7 +730,7 @@ __device__ static inline void decay_values_backward(
     row_sum(d_beta_reg, w_bases_col); // d_beta = einsum('tk->t', w_bases);
     row_sum(d_beta_reg, u_bases_col, d_beta_reg); // d_beta += einsum('tw->t', u_bases);
 
-    if (1) {
+    if constexpr (_value_groups > 1) {
         int *lock = &locks[2*kNumWarps*gridDim.z + blockIdx.z*kNumWarps + kittens::warpid()];
 
         // lock
@@ -746,6 +750,8 @@ __device__ static inline void decay_values_backward(
             atomicExch(lock, 0);
         }
         __syncwarp();
+    } else {
+        store(_d_beta + chunk*beta_reg.outer_dim*TILE_DIM, d_beta_reg);
     }
 }
 
