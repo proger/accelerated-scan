@@ -1,0 +1,3 @@
+[submodule "accelerated_scan/tk"]
+	path = accelerated_scan/tk
+	url = https://github.com/HazyResearch/ThunderKittens

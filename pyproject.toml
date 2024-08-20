@@ -6,7 +6,9 @@ build-backend = "hatchling.build"
 name = "accelerated-scan"
 dynamic = ["version"]
 dependencies = [
-  "torch>=2.1.0"
+  "torch>=2.1.0",
+  "ninja", # compiling kernels on the fly
+  "matplotlib" # triton perf_report
 ]
 authors = [
   { name="Volodymyr Kyrylov", email="vol@wilab.org.ua" },
