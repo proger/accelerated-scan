@@ -15,88 +15,71 @@ def combine1(xl, fl, xr, fr):
 
 @triton.jit
 def forward_scan(
-    gates,
-    tokens,
-    outputs,
+    forget,
+    inputs,
+    states,
     T: tl.constexpr,
+    REVERSE: tl.constexpr = False,
 ):
     sequence_id = tl.num_programs(axis=1) * tl.program_id(axis=0) + tl.program_id(axis=1)
-    strides = tl.arange(0, T) + sequence_id * T
+    stride = tl.arange(0, T) + sequence_id * T
 
-    tokens_ = tl.load(tokens + strides)
-    gates_ = tl.load(gates + strides)
+    inputs_ = tl.load(inputs + stride)
+    forget_ = tl.load(forget + stride)
 
-    output_tokens_, output_gates_ = tl.associative_scan((tokens_, gates_), axis=0, combine_fn=combine1)
-    tl.store(outputs + strides, output_tokens_)
-
-
-@triton.jit
-def backward_scan(
-    gates,
-    tokens,
-    outputs,
-    T: tl.constexpr,
-):
-    sequence_id = tl.num_programs(axis=1) * tl.program_id(axis=0) + tl.program_id(axis=1)
-    forward_strides = tl.arange(0, T) + sequence_id * T
-    reverse_strides = (tl.num_programs(axis=0) * tl.num_programs(axis=1) * T - 1) - forward_strides
-
-    tokens_ = tl.load(tokens + reverse_strides)
-    gates_ = tl.load(gates + reverse_strides)
-
-    output_tokens_, output_gates_ = tl.associative_scan((tokens_, gates_), axis=0, combine_fn=combine1)
-    tl.store(outputs + reverse_strides, output_tokens_)
+    states_, forget_states_ = tl.associative_scan((inputs_, forget_), axis=0, combine_fn=combine1, reverse=REVERSE)
+    tl.store(states + stride, states_)
 
 
 class Scan(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gates, tokens):
-        B, C, T = gates.shape
-        assert tokens.shape == (B, C, T)
-        assert gates.is_contiguous()
-        assert tokens.is_contiguous()
+    def forward(ctx, forget, inputs):
+        B, C, T = forget.shape
+        assert inputs.shape == (B, C, T)
+        assert forget.is_contiguous()
+        assert inputs.is_contiguous()
 
-        states = torch.zeros_like(tokens)
-        forward_scan[(B,C)](gates, tokens, states, T=T, enable_fp_fusion=False)
+        states = torch.zeros_like(inputs)
+        forward_scan[(B,C)](forget, inputs, states, T=T, enable_fp_fusion=False)
 
-        ctx.save_for_backward(states, gates)
+        ctx.save_for_backward(states, forget)
         return states
 
     # backward scan is a padded reverse scan
     # See https://arxiv.org/abs/1709.04057 Section 2.2
     @staticmethod
-    def backward(ctx, grad_output):
-        states, gates = ctx.saved_tensors
-        B, C, T = gates.shape
+    def backward(ctx, d_output):
+        states, forget = ctx.saved_tensors
+        B, C, T = forget.shape
 
-        grad_output = grad_output.contiguous()
+        d_output = d_output.contiguous()
         assert states.is_contiguous()
-        assert gates.is_contiguous()
+        assert forget.is_contiguous()
 
-        d_states = torch.empty_like(states)
-        padded_shifted_gates = torch.cat([gates, torch.ones_like(gates[:, :, :1])], dim=-1)[:, :, 1:].contiguous()
-        backward_scan[(B,C)](padded_shifted_gates, grad_output, d_states, T=T, enable_fp_fusion=False)
+        d_forget = torch.empty_like(forget)
+        d_inputs = torch.empty_like(states)
 
-        padded_outputs = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)[:, :, :-1]
-        d_gates = padded_outputs * d_states
+        padded_shifted_forget = torch.cat([forget, torch.ones_like(forget[:, :, :1])], dim=-1)[:, :, 1:].contiguous()
+        forward_scan[(B,C)](padded_shifted_forget, d_output, d_inputs, T=T, REVERSE=True, enable_fp_fusion=False)
+        padded_states = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)[:, :, :-1]
+        d_forget = padded_states * d_inputs
 
-        d_tokens = d_states
-        return d_gates, d_tokens
+        return d_forget, d_inputs
 
 
-def scan(gates, tokens):
+def scan(forget, inputs):
     """Solve a first-order recurrence relation:
 
     .. math::
         x_t = a_t x_{t-1} + b_t
 
-    where :math:`a_t` ("gates") and :math:`b_t` ("tokens") are sequences of vectors.
+    where :math:`a_t` ("forget") and :math:`b_t` ("inputs") are sequences of vectors.
 
     Arguments:
-        gates (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
-        tokens (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
+        forget (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
+        inputs (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
 
     Returns:
         (torch.Tensor): shape (B, C, T)
     """
-    return Scan.apply(gates, tokens)
+    return Scan.apply(forget, inputs)
