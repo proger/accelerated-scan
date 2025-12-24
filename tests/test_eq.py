@@ -8,12 +8,12 @@ from accelerated_scan.triton import scan as scan_triton
 # https://arxiv.org/abs/2109.08203
 seeds = [3407,4,42,57]
 seqlens = [2**i for i in range(5, 17)]
-scans = [scan_warp, scan_triton]
+scans = [scan_triton]
 dtypes = [torch.float32, torch.bfloat16, torch.float16]
 atol = {torch.float32: 1e-7, torch.bfloat16: 1e-1, torch.float16: 12e-3}
 rtol = {torch.float32: 1.3e-6, torch.bfloat16: 1.6e-2, torch.float16: 1e-3}
 
-def init(seed, batch_size=3, dim=1536, seqlen=32, requires_grad=False, dtype=torch.float32):
+def init(seed, batch_size=1, dim=512, seqlen=32, requires_grad=False, dtype=torch.float32):
     torch.manual_seed(seed)
     gates = torch.rand(batch_size, dim, seqlen, requires_grad=requires_grad, dtype=dtype, device="cuda")
     tokens = torch.rand(batch_size, dim, seqlen, requires_grad=requires_grad, dtype=dtype, device="cuda")

@@ -2,6 +2,7 @@ import math
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 
 
 def split(x: torch.Tensor) -> torch.Tensor:
@@ -73,10 +74,17 @@ def scan(
     Returns:
         (torch.Tensor): shape (B, C, T)
     """
-    B,C,T = tokens.size()
-    level = int(math.log2(T))
+    B, C, T = tokens.size()
+    padded_T = 1 << (T - 1).bit_length()
+    if padded_T != T:
+        pad_len = padded_T - T
+        gates = F.pad(gates, (0, pad_len), value=1).contiguous()
+        tokens = F.pad(tokens, (0, pad_len), value=0).contiguous()
+
+    level = int(math.log2(padded_T))
     _, x = scan1(gates, tokens, mul, add, zeros_like, ones_like, level=level, reverse=reverse)
-    return add(mul(x, gates), tokens)
+    out = add(mul(x, gates), tokens)
+    return out[:, :, :T]
 
 
 def scan1(
