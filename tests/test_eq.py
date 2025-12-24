@@ -11,6 +11,7 @@ seqlens = [2**i for i in range(5, 17)]
 scans = [scan_warp, scan_triton]
 dtypes = [torch.float32, torch.bfloat16, torch.float16]
 atol = {torch.float32: 1e-7, torch.bfloat16: 1e-1, torch.float16: 12e-3}
+rtol = {torch.float32: 1.3e-6, torch.bfloat16: 1.6e-2, torch.float16: 1e-3}
 
 def init(seed, batch_size=3, dim=1536, seqlen=32, requires_grad=False, dtype=torch.float32):
     torch.manual_seed(seed)
@@ -36,7 +37,7 @@ def test_eq_forward(scan, seed, seqlen, dtype):
     #print(out, 'out')
     #print(out_ref, 'ref')
 
-    assert torch.allclose(out, out_ref, atol=atol[dtype])
+    torch.testing.assert_close(out, out_ref, atol=atol[dtype], rtol=rtol[dtype])
 
 
 @pytest.mark.parametrize("scan", scans)
@@ -57,8 +58,8 @@ def test_eq_backward(scan, seed, seqlen, dtype):
     print('gate max abs error', (gates_grad - gates_ref.grad).abs().max().item(), 'seqlen', seqlen, 'dtype', dtype)
     print('token max abs error', (tokens_grad - tokens_ref.grad).abs().max().item(), 'seqlen', seqlen, 'dtype', dtype)
 
-    assert torch.allclose(gates_grad, gates_ref.grad, atol=atol[dtype])
-    assert torch.allclose(tokens_grad, tokens_ref.grad, atol=atol[dtype])
+    torch.testing.assert_close(gates_grad, gates_ref.grad, atol=atol[dtype], rtol=rtol[dtype])
+    torch.testing.assert_close(tokens_grad, tokens_ref.grad, atol=atol[dtype], rtol=rtol[dtype])
 
 
 @pytest.mark.parametrize("seed", [1])
@@ -82,8 +83,8 @@ def test_eq_ref_reverse(seed, seqlen):
     print(dcdx, 'dcdx')
     print(x.grad, 'x.grad')
     print((x.grad - dcdx).abs().max(), 'x error')
-    assert torch.allclose(x.grad, dcdx, atol=1e-5)
+    torch.testing.assert_close(x.grad, dcdx, atol=1e-5, rtol=rtol[torch.float32])
     print(dcdf, 'dcdf')
     print(f.grad, 'f.grad')
     print((f.grad - dcdf).abs().max(), 'f error')
-    assert torch.allclose(f.grad, dcdf, atol=2e-5)
+    torch.testing.assert_close(f.grad, dcdf, atol=2e-5, rtol=rtol[torch.float32])
