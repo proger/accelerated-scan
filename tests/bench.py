@@ -47,14 +47,14 @@ def bench(provider, SEQUENCE_LENGTH, device="cuda", direction: Literal["forward"
             print(f"Running {direction} {provider} with sequence length {SEQUENCE_LENGTH}")
             match direction:
                 case "forward":
-                    from accelerated_scan.triton import forward_scan
+                    from accelerated_scan.scalar import forward_scan
                     scan = lambda: forward_scan[(B,C)](gates, tokens, outputs, SEQUENCE_LENGTH, enable_fp_fusion=False)
                 case "backward":
-                    from accelerated_scan.triton import backward_scan
+                    from accelerated_scan.scalar import backward_scan
                     scan = lambda: backward_scan[(B,C)](gates, tokens, outputs, SEQUENCE_LENGTH, enable_fp_fusion=False)
                 case "train":
                     # note that these measurements include time for memory allocation for forward output tensors
-                    from accelerated_scan.triton import scan as train_scan
+                    from accelerated_scan.scalar import scan as train_scan
                     scan = lambda: grad2(train_scan, gates, tokens, grad_outputs)
         case "ref":
             print(f"Running {provider} with sequence length {SEQUENCE_LENGTH} {direction}")

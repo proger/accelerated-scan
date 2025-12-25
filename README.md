@@ -12,7 +12,7 @@ on each level of hierarchy: [warp shuffles](https://developer.nvidia.com/blog/us
 
 The derivation of [Chunked Scan](https://proger.github.io/posts/scan/chunk.html) has been used to extend tree-level Blelloch algorithm to block.
 
-A similar implementation is available in `accelerated_scan.triton` using a Triton's `tl.associative_scan` primitive. It [requires Triton 2.2 for its `enable_fp_fusion` flag](https://twitter.com/darkproger/status/1742663555835363635).
+A similar implementation is available in `accelerated_scan.scalar` using a Triton's `tl.associative_scan` primitive. It [requires at least Triton 2.2 for its `enable_fp_fusion` flag](https://twitter.com/darkproger/status/1742663555835363635).
 
 Quick Start:
 
@@ -22,18 +22,15 @@ pip install accelerated-scan
 
 ```python
 import torch
-from accelerated_scan.warp import scan # a pure c++ kernel, faster than cub
-#from accelerated_scan.triton import scan # uses tl.associative_scan
+from accelerated_scan.scalar import scan # uses tl.associative_scan in chunks
+#from accelerated_scan.warp import scan # a pure c++ kernel, faster than cub
 #from accelerated_scan.ref import scan # reference torch implementation
 
-# sequence lengths must be a power of 2 of lengths between 32 and 65536
-# hit me up if you need different lengths!
+batch_size, dim, seqlen = 1, 512, 131072
+forget = 0.999 + 0.001 * torch.rand(batch_size, dim, seqlen, device="cuda")
+inputs = torch.rand(batch_size, dim, seqlen, device="cuda")
 
-batch_size, dim, seqlen = 3, 1536, 4096
-gates = 0.999 + 0.001 * torch.rand(batch_size, dim, seqlen, device="cuda")
-tokens = torch.rand(batch_size, dim, seqlen, device="cuda")
-
-out = scan(gates, tokens)
+out = scan(forget, inputs)
 ```
 
 To ensure numerical equivalence, a reference implementation for trees is provided in Torch. It can be sped up using `torch.compile`.
@@ -45,7 +42,7 @@ To ensure numerical equivalence, a reference implementation for trees is provide
 See more benchmarks in nanokitchen: https://github.com/proger/nanokitchen
 
 
-forward speed of (8,1536,seqlen), inference mode:
+forward speed of (8,1536,seqlen), forward-only, accelerated-scan version 0.2.0:
 ```
    SEQUENCE_LENGTH  accelerated_scan.triton (triton 2.2.0)  accelerated_scan.ref  accelerated_scan.warp
 0            128.0                                0.027382              0.380874               0.026844

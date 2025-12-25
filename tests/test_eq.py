@@ -3,7 +3,7 @@ import pytest
 import torch
 from accelerated_scan.ref import scan as scan_ref
 from accelerated_scan.warp import scan as scan_warp
-from accelerated_scan.triton import scan as scan_triton
+from accelerated_scan.scalar import scan as scan_triton
 
 # https://arxiv.org/abs/2109.08203
 seeds = [3407, 4, 42, 57]
