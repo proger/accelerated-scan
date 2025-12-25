@@ -112,8 +112,9 @@ def backward_scan(
         tl.store(d_inputs + offset, d_inputs_r, mask=t < seqlen)
         tl.store(d_inputs + offset + 1, d_inputs_i, mask=t < seqlen)
 
-        shifted_states_r = tl.load(states + offset - 2, mask=t > 0, other=0.0)
-        shifted_states_i = -tl.load(states + offset - 1, mask=t > 0, other=0.0)
+        shifted_states_mask = (t > 0) & (t < seqlen)
+        shifted_states_r = tl.load(states + offset - 2, mask=shifted_states_mask, other=0.0)
+        shifted_states_i = -tl.load(states + offset - 1, mask=shifted_states_mask, other=0.0)
 
         d_forget_r, d_forget_i = complex_mul(shifted_states_r, shifted_states_i, d_inputs_r, d_inputs_i)
         tl.store(d_forget + offset, d_forget_r, mask=t < seqlen)
