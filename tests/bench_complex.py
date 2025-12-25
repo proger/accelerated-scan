@@ -20,7 +20,6 @@ def bench(provider, block, *, B, C, T, device):
     forget_real = torch.view_as_real(forget).contiguous()
     inputs_real = torch.view_as_real(inputs_complex).contiguous()
     states_real = torch.empty_like(inputs_real)
-    true_nblocks = triton.cdiv(T, block)
 
     d_output = torch.randn_like(inputs_complex)
     d_output_real = torch.view_as_real(d_output).contiguous()

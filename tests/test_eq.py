@@ -6,8 +6,8 @@ from accelerated_scan.warp import scan as scan_warp
 from accelerated_scan.triton import scan as scan_triton
 
 # https://arxiv.org/abs/2109.08203
-seeds = [3407,4,42,57]
-seqlens = [2**i for i in range(5, 17)]
+seeds = [3407, 4, 42, 57]
+seqlens = [2**i for i in range(5, 17)] + [16323, 8000, 33753, 127323]
 scans = [scan_triton]
 dtypes = [torch.float32, torch.bfloat16, torch.float16]
 atol = {torch.float32: 1e-7, torch.bfloat16: 1e-1, torch.float16: 12e-3}

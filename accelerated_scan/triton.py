@@ -18,17 +18,31 @@ def forward_scan(
     forget,
     inputs,
     states,
-    T: tl.constexpr,
-    REVERSE: tl.constexpr = False,
+    seqlen,
+    BLOCK: tl.constexpr = 2048,
 ):
-    sequence_id = tl.num_programs(axis=1) * tl.program_id(axis=0) + tl.program_id(axis=1)
-    stride = sequence_id * T + tl.arange(0, T)
+    nblocks = tl.cdiv(seqlen, BLOCK)
+    bsz, chan = tl.program_id(axis=0), tl.program_id(axis=1)
+    sequence_id = tl.num_programs(axis=1) * bsz + chan
+    idx = tl.arange(0, BLOCK)
+    h0 = tl.zeros((), dtype=tl.float32)
 
-    inputs_ = tl.load(inputs + stride)
-    forget_ = tl.load(forget + stride)
+    for block_id in tl.range(0, nblocks):
+        t = block_id * BLOCK + idx
+        offset = sequence_id * seqlen + t
 
-    states_, forget_states_ = tl.associative_scan((inputs_, forget_), axis=0, combine_fn=combine1, reverse=REVERSE)
-    tl.store(states + stride, states_)
+        i = tl.load(inputs + offset, mask=t < seqlen, other=0.0)
+        f = tl.load(forget + offset, mask=t < seqlen, other=1.0)
+
+        h, f = tl.associative_scan((i, f), axis=0, combine_fn=combine1)
+
+        block_h = tl.sum(tl.where(idx == BLOCK - 1, h, 0.0), axis=0)
+        block_f = tl.sum(tl.where(idx == BLOCK - 1, f, 0.0), axis=0)
+
+        h = h + h0 * f
+        tl.store(states + offset, h, mask=t < seqlen)
+
+        h0 = block_h + h0 * block_f
 
 
 @triton.jit
@@ -36,22 +50,40 @@ def backward_scan(
     forget,
     states,
     d_output,
-    d_forget,
     d_inputs,
-    T: tl.constexpr,
+    d_forget,
+    seqlen,
+    BLOCK: tl.constexpr = 2048,
 ):
-    sequence_id = tl.num_programs(axis=1) * tl.program_id(axis=0) + tl.program_id(axis=1)
-    stride = sequence_id * T + tl.arange(0, T)
+    nblocks = tl.cdiv(seqlen, BLOCK)
+    bsz, chan = tl.program_id(axis=0), tl.program_id(axis=1)
+    sequence_id = tl.num_programs(axis=1) * bsz + chan
+    idx = tl.arange(0, BLOCK)
+    h0 = tl.zeros((), dtype=tl.float32)
 
-    d_output_ = tl.load(d_output + stride)
-    shifted_forget_ = tl.load(forget + stride + 1, mask=tl.arange(0, T) < T-1, other=1.0)
+    for block_id in tl.range(0, nblocks):
+        reverse_block = nblocks - 1 - block_id
+        t = reverse_block * BLOCK + idx
+        offset = sequence_id * seqlen + t
 
-    d_inputs_, _ = tl.associative_scan((d_output_, shifted_forget_), axis=0, combine_fn=combine1, reverse=True)
-    tl.store(d_inputs + stride, d_inputs_)
+        do = tl.load(d_output + offset, mask=t < seqlen, other=0.0)
 
-    shifted_states_ = tl.load(states + stride - 1, mask=tl.arange(0, T) > 0, other=0.0)
-    d_forget_ = shifted_states_ * d_inputs_
-    tl.store(d_forget + stride, d_forget_)
+        shifted_f = tl.load(forget + offset + 1, mask=t < seqlen - 1, other=1.0)
+
+        di, f = tl.associative_scan((do, shifted_f), axis=0, combine_fn=combine1, reverse=True)
+
+        block_di = tl.sum(tl.where(idx == 0, di, 0.0), axis=0)
+        block_f = tl.sum(tl.where(idx == 0, f, 0.0), axis=0)
+
+        di = di + h0 * f
+        tl.store(d_inputs + offset, di, mask=t < seqlen)
+
+        shifted_states = tl.load(states + offset - 1, mask=t > 0, other=0.0)
+
+        df = shifted_states * di
+        tl.store(d_forget + offset, df, mask=t < seqlen)
+
+        h0 = block_di + h0 * block_f
 
 
 class Scan(torch.autograd.Function):
@@ -62,8 +94,8 @@ class Scan(torch.autograd.Function):
         assert forget.is_contiguous()
         assert inputs.is_contiguous()
 
-        states = torch.zeros_like(inputs)
-        forward_scan[(B,C)](forget, inputs, states, T=T, enable_fp_fusion=False)
+        states = torch.empty_like(inputs)
+        forward_scan[(B, C)](forget, inputs, states, seqlen=T, enable_fp_fusion=False)
 
         ctx.save_for_backward(forget, states)
         return states
@@ -81,14 +113,15 @@ class Scan(torch.autograd.Function):
 
         d_forget = torch.empty_like(forget)
         d_inputs = torch.empty_like(states)
-
-        if False:
-            shifted_forget = torch.cat([forget, torch.ones_like(forget[:, :, :1])], dim=-1)[:, :, 1:].contiguous()
-            forward_scan[(B,C)](shifted_forget, d_output, d_inputs, T=T, REVERSE=True, enable_fp_fusion=False)
-            shifted_states = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)[:, :, :-1]
-            d_forget = shifted_states * d_inputs
-        else:
-            backward_scan[(B,C)](forget, states, d_output, d_forget, d_inputs, T=T, enable_fp_fusion=False)
+        backward_scan[(B, C)](
+            forget,
+            states,
+            d_output,
+            d_inputs,
+            d_forget,
+            seqlen=T,
+            enable_fp_fusion=False,
+        )
 
         return d_forget, d_inputs
 
@@ -102,10 +135,10 @@ def scan(forget, inputs):
     where :math:`a_t` ("forget") and :math:`b_t` ("inputs") are sequences of vectors.
 
     Arguments:
-        forget (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
-        inputs (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
+        forget (torch.Tensor): shape (B, C, T), must be contiguous.  T can be any length.
+        inputs (torch.Tensor): shape (B, C, T), must be contiguous.
 
     Returns:
-        (torch.Tensor): shape (B, C, T)
+        (torch.Tensor): same shape as inputs
     """
     return Scan.apply(forget, inputs)

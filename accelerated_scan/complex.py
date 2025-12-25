@@ -141,7 +141,6 @@ class Scan(torch.autograd.Function):
         forget_real = torch.view_as_real(forget)
         inputs_real = torch.view_as_real(inputs)
         states_real = torch.empty_like(inputs_real)
-        true_nblocks = triton.cdiv(T, 2048)
         forward_scan[(B, C)](
             forget_real,
             inputs_real,
