@@ -75,26 +75,48 @@ def backward_scan(
     seqlen,
     BLOCK: tl.constexpr = 2048,
 ):
+    """
+    Backward pass for complex linear recurrence:
+    x[t] = a[t] * x[t-1] + b[t]
+
+    Inputs:
+      - a[t] is `forget` (complex64 packed as (real, imag))
+      - x[t] is `states` (forward states, same packing)
+      - d_output[t] is the local gradient contribution dL/dx[t] from the loss
+    Define the total adjoint on the state: g[t] = dL/dx[t].
+    Right-to-left adjoint recursion:
+        g[t] = d_output[t] + conj(a[t+1]) g[t+1],    with boundary g[T] = 0
+
+    Outputs:
+      - d_inputs[t] stores dL/db[t]. Since dx[t]/db[t] = 1, we have dL/db[t] = g[t].
+      - d_forget[t] stores dL/da[t] = g[t] conj(x[t-1]).
+    """
     nblocks = tl.cdiv(seqlen, BLOCK)
     bsz, chan = tl.program_id(axis=0), tl.program_id(axis=1)
     sequence_id = tl.num_programs(axis=1) * bsz + chan
     idx = tl.arange(0, BLOCK)
+
+    # Inter-block carry: future contribution to dL/dx at the block boundary
     state_x_r = tl.zeros((), dtype=tl.float32)
     state_x_i = tl.zeros((), dtype=tl.float32)
-    state_f_r = tl.full((), 1.0, dtype=tl.float32)
-    state_f_i = tl.zeros((), dtype=tl.float32)
 
+    # Process blocks right to left
     for block_id in tl.range(0, nblocks):
         reverse_block = nblocks - 1 - block_id
         t = reverse_block * BLOCK + idx
         offset = (sequence_id * seqlen + t) * 2
 
+        # Load local gradient dL/dx[t]
         d_output_r = tl.load(d_output + offset, mask=t < seqlen, other=0.0)
         d_output_i = tl.load(d_output + offset + 1, mask=t < seqlen, other=0.0)
 
+        # Load conj(a[t+1]). Boundary: a[T+1] = 1 (no contribution from beyond sequence end)
         shifted_forget_r = tl.load(forget + offset + 2, mask=t < seqlen - 1, other=1.0)
         shifted_forget_i = -tl.load(forget + offset + 3, mask=t < seqlen - 1, other=0.0)
 
+        # Intra block scan computes: g_block[t] = d_output[t] + conj(a[t+1]) * g_block[t+1]
+        # This assumes zero incoming carry.
+        # also collect f[t] =\prod_{k=t}^{block_end} conj(a[k+1])
         d_inputs_r, d_inputs_i, f_r, f_i = tl.associative_scan(
             (d_output_r, d_output_i, shifted_forget_r, shifted_forget_i),
             axis=0,
@@ -102,16 +124,22 @@ def backward_scan(
             reverse=True,
         )
 
+        # Block summary at the block's left boundary (idx=0 for reverse scan)
+        # block_x = g_block[block_left] and block_f = f[block_left]
         block_x_r = tl.sum(tl.where(idx == 0, d_inputs_r, 0.0), axis=0)
         block_x_i = tl.sum(tl.where(idx == 0, d_inputs_i, 0.0), axis=0)
         block_f_r = tl.sum(tl.where(idx == 0, f_r, 0.0), axis=0)
         block_f_i = tl.sum(tl.where(idx == 0, f_i, 0.0), axis=0)
 
-        state_mul_r, state_mul_i = complex_mul(d_inputs_r, d_inputs_i, state_f_r, state_f_i)
-        d_inputs_r, d_inputs_i = state_mul_r + state_x_r, state_mul_i + state_x_i
+        # Add inter-block carry: g[t] = g_block[t] + state_x * f[t]
+        state_mul_r, state_mul_i = complex_mul(state_x_r, state_x_i, f_r, f_i)
+        d_inputs_r = d_inputs_r + state_mul_r
+        d_inputs_i = d_inputs_i + state_mul_i
         tl.store(d_inputs + offset, d_inputs_r, mask=t < seqlen)
         tl.store(d_inputs + offset + 1, d_inputs_i, mask=t < seqlen)
 
+        # Compute dL/da[t] = conj(x[t-1]) * g[t]
+        # Boundary: x[-1] = 0 (no predecessor for first position)
         shifted_states_mask = (t > 0) & (t < seqlen)
         shifted_states_r = tl.load(states + offset - 2, mask=shifted_states_mask, other=0.0)
         shifted_states_i = -tl.load(states + offset - 1, mask=shifted_states_mask, other=0.0)
@@ -120,9 +148,10 @@ def backward_scan(
         tl.store(d_forget + offset, d_forget_r, mask=t < seqlen)
         tl.store(d_forget + offset + 1, d_forget_i, mask=t < seqlen)
 
-        state_mul_r, state_mul_i = complex_mul(block_x_r, block_x_i, state_f_r, state_f_i)
-        state_x_r, state_x_i = state_mul_r + state_x_r, state_mul_i + state_x_i
-        state_f_r, state_f_i = complex_mul(block_f_r, block_f_i, state_f_r, state_f_i)
+        # Update carry for the next block: state_x = block_x + state_x * block_f
+        state_mul_r, state_mul_i = complex_mul(state_x_r, state_x_i, block_f_r, block_f_i)
+        state_x_r = block_x_r + state_mul_r
+        state_x_i = block_x_i + state_mul_i
 
 
 class Scan(torch.autograd.Function):
