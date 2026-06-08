@@ -35,6 +35,10 @@ out = scan(forget, inputs)
 
 To ensure numerical equivalence, a reference implementation for trees is provided in Torch. It can be sped up using `torch.compile`.
 
+## AMD GPUs (ROCm)
+
+accelerated-scan runs on AMD GPUs with a ROCm build of PyTorch. On ROCm, `accelerated_scan.warp` automatically uses the wave-size-agnostic Triton backend (`accelerated_scan.scalar`), because the C++ warp kernel assumes a 32-lane warp that does not hold on a 64-lane CDNA wavefront. Install as usual (`pip install accelerated-scan`, or `pip install -e .` from a checkout) with a ROCm PyTorch and Triton; the `scan` API and `device="cuda"` tensors are unchanged.
+
 ## Benchmarks:
 
 ![bench.png](bench.png)

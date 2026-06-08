@@ -62,6 +62,35 @@ def test_eq_backward(scan, seed, seqlen, dtype):
     torch.testing.assert_close(tokens_grad, tokens_ref.grad, atol=atol[dtype], rtol=rtol[dtype])
 
 
+@pytest.mark.parametrize("seed", seeds)
+@pytest.mark.parametrize("seqlen", seqlens)
+@pytest.mark.parametrize("dtype", dtypes)
+@torch.inference_mode()
+def test_eq_reverse(seed, seqlen, dtype):
+    from accelerated_scan.warp import scan_forward
+
+    gates, tokens = init(seed, seqlen=seqlen, dtype=dtype)
+    out = scan_forward(gates, tokens, reverse=True)
+    out_ref = scan_ref(gates, tokens, reverse=True)
+
+    print('max abs error', (out - out_ref).abs().max().item(), 'seqlen', seqlen, 'dtype', dtype)
+
+    torch.testing.assert_close(out, out_ref, atol=atol[dtype], rtol=rtol[dtype])
+
+
+def test_warpscan_bindings():
+    from accelerated_scan.warp import warpscan_forward, warpscan_backward
+
+    gates, tokens = init(seeds[0], seqlen=128)
+    out = torch.empty_like(tokens)
+    warpscan_forward(gates, tokens, out, False)
+    out_ref = scan_ref(gates, tokens)
+    torch.testing.assert_close(out, out_ref, atol=atol[torch.float32], rtol=rtol[torch.float32])
+
+    with pytest.raises(NotImplementedError):
+        warpscan_backward(gates, out, torch.empty_like(out), torch.empty_like(gates), torch.empty_like(tokens))
+
+
 @pytest.mark.parametrize("seed", [1])
 @pytest.mark.parametrize("seqlen", seqlens)
 def test_eq_ref_reverse(seed, seqlen):

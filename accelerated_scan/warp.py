@@ -1,22 +1,69 @@
 from pathlib import Path
 
 import torch
-from torch.utils.cpp_extension import load_inline
 
-cuda_source = (Path(__file__).parent / 'warp.cuh').read_text()
+is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
 
-cpp_source = """
+if is_rocm:
+    # On ROCm, use the Triton implementation which is wave-size agnostic
+    # The C++ warp kernel has hardcoded wave-size assumptions that require
+    # significant rework for wave64 (gfx90a) vs wave32 (gfx1100) compatibility
+    from accelerated_scan.scalar import scan as _scan_impl, Scan as _ScanClass
+
+    def scan_forward(gates, tokens, reverse=False):
+        if reverse:
+            # A reverse scan of x_t = a_t x_{t-1} + b_t is the time-reversal of a
+            # forward scan on the time-reversed inputs: flip(forward(flip(a), flip(b))).
+            # The Triton backend requires contiguous inputs, so materialize the flips.
+            return _scan_impl(gates.flip(-1).contiguous(), tokens.flip(-1).contiguous()).flip(-1)
+        return _scan_impl(gates, tokens)
+
+    def warpscan_forward(gates, tokens, out, reverse=False):
+        out.copy_(scan_forward(gates, tokens, reverse=reverse))
+        return out
+
+    def warpscan_backward(gates, output, outGrad, gateGradOut, valueGradOut):
+        raise NotImplementedError(
+            "warpscan_backward is the low-level C++ binding and is unavailable on "
+            "ROCm; the ROCm autograd path uses the Triton Scan.backward instead."
+        )
+
+    def scan(gates, tokens):
+        """Solve a first-order recurrence relation:
+
+        .. math::
+            x_t = a_t x_{t-1} + b_t
+
+        where :math:`a_t` ("gates") and :math:`b_t` ("tokens") are sequences of vectors.
+
+        Arguments:
+            gates (torch.Tensor): shape (B, C, T), must be contiguous.
+            tokens (torch.Tensor): shape (B, C, T), must be contiguous.
+
+        Returns:
+            (torch.Tensor): shape (B, C, T)
+        """
+        return _scan_impl(gates, tokens)
+
+    class Scan(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, gates, tokens):
+            return _ScanClass.forward(ctx, gates, tokens)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            return _ScanClass.backward(ctx, grad_output)
+else:
+    from torch.utils.cpp_extension import load_inline
+
+    cuda_source = (Path(__file__).parent / 'warp.cuh').read_text()
+
+    cpp_source = """
 at::Tensor warpscan_forward(const at::Tensor &gates, const at::Tensor &tokens, const at::Tensor &out, const bool reverse);
 void warpscan_backward(const at::Tensor &gates, const at::Tensor &output, const at::Tensor &outGrad, const at::Tensor& gateGradOut, const at::Tensor& valueGradOut);
 """
 
-module = load_inline(
-    name='warpscan',
-    cpp_sources=[cpp_source],
-    cuda_sources=[cuda_source],
-    functions=['warpscan_forward', 'warpscan_backward'],
-    verbose=True,
-    extra_cuda_cflags=[
+    extra_flags = [
         "-O3",
         "-std=c++17",
         "--ptxas-options=-v",
@@ -25,59 +72,67 @@ module = load_inline(
         "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
     ]
-)
-warpscan_forward = module.warpscan_forward
-warpscan_backward = module.warpscan_backward
 
-def scan_forward(gates, tokens, reverse=False):
-    output = torch.zeros_like(tokens)
-    warpscan_forward(gates, tokens, output, reverse)
-    return output
+    module = load_inline(
+        name='warpscan',
+        cpp_sources=[cpp_source],
+        cuda_sources=[cuda_source],
+        functions=['warpscan_forward', 'warpscan_backward'],
+        verbose=True,
+        extra_cuda_cflags=extra_flags,
+    )
+    warpscan_forward = module.warpscan_forward
+    warpscan_backward = module.warpscan_backward
 
-
-class Scan(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, gates, tokens):
-        B, C, T = gates.shape
-        assert tokens.shape == (B, C, T)
-        assert gates.is_contiguous()
-        assert tokens.is_contiguous()
-
-        states = scan_forward(gates, tokens)
-        ctx.save_for_backward(states, gates)
-        return states
-
-    # backward scan is a padded reverse scan
-    # See https://arxiv.org/abs/1709.04057 Section 2.2
-    @staticmethod
-    def backward(ctx, grad_output):
-        states, gates = ctx.saved_tensors
-        B, C, T = gates.shape
-
-        grad_output = grad_output.contiguous()
-        assert states.is_contiguous()
-        assert gates.is_contiguous()
-
-        d_gates = torch.empty_like(gates)
-        d_tokens = torch.empty_like(gates)
-        warpscan_backward(gates, states, grad_output, d_gates, d_tokens)
-
-        return d_gates, d_tokens
+    def scan_forward(gates, tokens, reverse=False):
+        output = torch.zeros_like(tokens)
+        warpscan_forward(gates, tokens, output, reverse)
+        return output
 
 
-def scan(gates, tokens):
-    """Solve a first-order recurrence relation:
+    class Scan(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, gates, tokens):
+            B, C, T = gates.shape
+            assert tokens.shape == (B, C, T)
+            assert gates.is_contiguous()
+            assert tokens.is_contiguous()
 
-    .. math::
-        x_t = a_t x_{t-1} + b_t
+            states = scan_forward(gates, tokens)
+            ctx.save_for_backward(states, gates)
+            return states
 
-    where :math:`a_t` ("gates") and :math:`b_t` ("tokens") are sequences of vectors.
+        # backward scan is a padded reverse scan
+        # See https://arxiv.org/abs/1709.04057 Section 2.2
+        @staticmethod
+        def backward(ctx, grad_output):
+            states, gates = ctx.saved_tensors
+            B, C, T = gates.shape
 
-    Arguments:
-        gates (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
-        tokens (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
+            grad_output = grad_output.contiguous()
+            assert states.is_contiguous()
+            assert gates.is_contiguous()
 
-    Returns:
-        (torch.Tensor): shape (B, C, T)
-    """
-    return Scan.apply(gates, tokens)
+            d_gates = torch.empty_like(gates)
+            d_tokens = torch.empty_like(gates)
+            warpscan_backward(gates, states, grad_output, d_gates, d_tokens)
+
+            return d_gates, d_tokens
+
+
+    def scan(gates, tokens):
+        """Solve a first-order recurrence relation:
+
+        .. math::
+            x_t = a_t x_{t-1} + b_t
+
+        where :math:`a_t` ("gates") and :math:`b_t` ("tokens") are sequences of vectors.
+
+        Arguments:
+            gates (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
+            tokens (torch.Tensor): shape (B, C, T), must be contiguous. T must be a power of 2.
+
+        Returns:
+            (torch.Tensor): shape (B, C, T)
+        """
+        return Scan.apply(gates, tokens)

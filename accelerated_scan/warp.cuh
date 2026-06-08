@@ -6,6 +6,13 @@
 
 #define CHECK_STRIDE(x) TORCH_CHECK(x.stride(-1) == 1 || x.size(-1) == 1);
 
+// ROCm/HIP compatibility: HIP requires 64-bit shuffle masks
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+#define FULL_WARP_MASK 0xffffffffffffffffULL
+#else
+#define FULL_WARP_MASK 0xffffffff
+#endif
+
 template<typename weight_t, int N>
 class UnalignedTuple {
 public:
@@ -137,8 +144,8 @@ __global__ void scan(
 
         #pragma unroll
         for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
-            weight_t prev_gate = __shfl_up_sync(0xffffffff, accGate.data[kThreadLast], delta);
-            weight_t prev_token = __shfl_up_sync(0xffffffff, accToken.data[kThreadLast], delta);
+            weight_t prev_gate = __shfl_up_sync(FULL_WARP_MASK, accGate.data[kThreadLast], delta, kNThreadsPerWarp);
+            weight_t prev_token = __shfl_up_sync(FULL_WARP_MASK, accToken.data[kThreadLast], delta, kNThreadsPerWarp);
 
             if (laneId >= delta) {
                 #pragma unroll
@@ -172,9 +179,9 @@ __global__ void scan(
             warpAccToken = (laneId < kNWarpsPerBlock) ? warpLastToken[laneId] : kEmptyToken;
 
             #pragma unroll
-            for (int delta = 1; delta < warpSize; delta *= 2) {
-                weight_t prev_gate = __shfl_up_sync(0xffffffff, warpAccGate, delta);
-                weight_t prev_token = __shfl_up_sync(0xffffffff, warpAccToken, delta);
+            for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
+                weight_t prev_gate = __shfl_up_sync(FULL_WARP_MASK, warpAccGate, delta, kNThreadsPerWarp);
+                weight_t prev_token = __shfl_up_sync(FULL_WARP_MASK, warpAccToken, delta, kNThreadsPerWarp);
 
                 if (laneId >= delta) {
                     warpAccToken = prev_token * warpAccGate + warpAccToken;
