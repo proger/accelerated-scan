@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -25,7 +26,7 @@ public:
 };
 
 template<typename T, int N>
-class alignas(16) AlignedTuple : public UnalignedTuple<T, N> {
+class alignas(sizeof(T) * N) AlignedTuple : public UnalignedTuple<T, N> {
 };
 
 template <typename Tuple, int offset>
@@ -202,6 +203,10 @@ __global__ void scan(
                 accGate.data[i] = warpLastGate[warpId-1] * accGate.data[i];
             }
         }
+        if (laneId == kWarpLast && warpId == kBlockLast) {
+            chunkAccGate = accGate.data[kThreadLast];
+            chunkAccToken = accToken.data[kThreadLast];
+        }
         if (reverse) {
             accToken.reverse();
         }
@@ -213,11 +218,6 @@ __global__ void scan(
                 gateGrad.data[i] = gateGrad.data[i] * accToken.data[i];
             }
             gateGradOut[tupleOffset] = gateGrad;
-        }
-
-        if (laneId == kWarpLast && warpId == kBlockLast) {
-            chunkAccGate = accGate.data[kThreadLast];
-            chunkAccToken = accToken.data[kThreadLast];
         }
     }
 }
@@ -235,12 +235,13 @@ __global__ void scan(
 #define DISPATCH_SCAN(weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse) \
     using AlignedT = AlignedTuple<weight_t, kNStepsPerThread>; \
     using UnalignedT = UnalignedTuple<weight_t, kNStepsPerThread>; \
+    static_assert(sizeof(AlignedT) == sizeof(weight_t) * kNStepsPerThread, "AlignedTuple must have no padding"); \
     if (kNStepsPerThread == 4 && \
-        ((long)gates.data_ptr()) % 16 == 0 && \
-        ((long)tokens.data_ptr()) % 16 == 0 && \
-        ((long)out.data_ptr()) % 16 == 0 && \
-        ((long)output) % 16 == 0 && \
-        ((long)gateGradOut) % 16 == 0) { \
+        ((uintptr_t)gates.data_ptr()) % alignof(AlignedT) == 0 && \
+        ((uintptr_t)tokens.data_ptr()) % alignof(AlignedT) == 0 && \
+        ((uintptr_t)out.data_ptr()) % alignof(AlignedT) == 0 && \
+        ((uintptr_t)output) % alignof(AlignedT) == 0 && \
+        ((uintptr_t)gateGradOut) % alignof(AlignedT) == 0) { \
         if (output) { \
             DISPATCH_SCAN_INNER(AlignedT, true, weight_t, kNStepsPerThread, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, grid, kNThreads, stream, gates, tokens, out, output, gateGradOut, batch_stride, dim_stride, reverse); \
         } else { \

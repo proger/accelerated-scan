@@ -1,4 +1,7 @@
 import torch
+from torch import Tensor
+from torch.library import triton_op, wrap_triton
+
 import triton
 import triton.language as tl
 
@@ -86,44 +89,67 @@ def backward_scan(
         h0 = block_di + h0 * block_f
 
 
-class Scan(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, forget, inputs):
-        B, C, T = forget.shape
-        assert inputs.shape == (B, C, T)
-        assert forget.is_contiguous()
-        assert inputs.is_contiguous()
+@triton_op("accelerated_scan::scalar_forward", mutates_args=())
+def scalar_forward(forget: Tensor, inputs: Tensor) -> Tensor:
+    B, C, T = forget.shape
+    torch._check(forget.shape == inputs.shape)
+    torch._check(forget.device == inputs.device)
+    torch._check(forget.is_cuda); torch._check(inputs.is_cuda)
+    torch._check(forget.dtype == inputs.dtype)
 
-        states = torch.empty_like(inputs)
-        forward_scan[(B, C)](forget, inputs, states, seqlen=T, enable_fp_fusion=False)
+    forget = forget.contiguous()
+    inputs = inputs.contiguous()
 
-        ctx.save_for_backward(forget, states)
-        return states
+    states = torch.empty_like(inputs)
+    wrap_triton(forward_scan)[(B, C)](
+        forget,
+        inputs,
+        states,
+        seqlen=T,
+        BLOCK=2048, # MUST add this or somehow the default value of BLOCK=2048 is not being passed to the kernel (when torch.compile)
+        enable_fp_fusion=False,
+    )
 
-    # backward scan is a padded reverse scan
-    # See https://arxiv.org/abs/1709.04057 Section 2.2
-    @staticmethod
-    def backward(ctx, d_output):
-        forget, states = ctx.saved_tensors
-        B, C, T = forget.shape
+    return states
 
-        d_output = d_output.contiguous()
-        assert forget.is_contiguous()
-        assert states.is_contiguous()
+# backward scan is a padded reverse scan
+# See https://arxiv.org/abs/1709.04057 Section 2.2
+@triton_op("accelerated_scan::scalar_backward", mutates_args=())
+def scalar_backward(states: Tensor, forget: Tensor, d_output: Tensor) -> tuple[Tensor, Tensor]:
+    B, C, T = states.shape
+    torch._check(states.shape == forget.shape)
+    torch._check(states.device == forget.device)
+    torch._check(states.is_cuda); torch._check(forget.is_cuda)
+    torch._check(states.dtype == forget.dtype)
 
-        d_forget = torch.empty_like(forget)
-        d_inputs = torch.empty_like(states)
-        backward_scan[(B, C)](
-            forget,
-            states,
-            d_output,
-            d_inputs,
-            d_forget,
-            seqlen=T,
-            enable_fp_fusion=False,
-        )
+    d_output = d_output.contiguous()
+    states = states.contiguous()
+    forget = forget.contiguous()
 
-        return d_forget, d_inputs
+    d_forget = torch.empty_like(forget)
+    d_inputs = torch.empty_like(states)
+    wrap_triton(backward_scan)[(B, C)](
+        forget,
+        states,
+        d_output,
+        d_inputs,
+        d_forget,
+        seqlen=T,
+        BLOCK=2048, # MUST add this or somehow the default value of BLOCK=2048 is not being passed to the kernel (when torch.compile)
+        enable_fp_fusion=False,
+    )
+
+    return d_forget, d_inputs
+
+def _setup_context(ctx, inputs, output):
+    forget, _inputs = inputs
+    ctx.save_for_backward(output, forget)
+
+def _backward(ctx, d_output):
+    states, forget = ctx.saved_tensors
+    return scalar_backward(states, forget, d_output)
+
+scalar_forward.register_autograd(_backward, setup_context=_setup_context)
 
 
 def scan(forget, inputs):
@@ -141,4 +167,4 @@ def scan(forget, inputs):
     Returns:
         (torch.Tensor): same shape as inputs
     """
-    return Scan.apply(forget, inputs)
+    return scalar_forward(forget, inputs)
