@@ -1,6 +1,8 @@
 from pathlib import Path
 
 import torch
+from torch import Tensor
+from torch.library import custom_op
 from torch.utils.cpp_extension import load_inline
 
 cuda_source = (Path(__file__).parent / 'warp.cuh').read_text()
@@ -18,7 +20,6 @@ module = load_inline(
     verbose=True,
     extra_cuda_cflags=[
         "-O3",
-        "-std=c++17",
         "--ptxas-options=-v",
         "-lineinfo",
         "--fmad", "false",
@@ -29,43 +30,73 @@ module = load_inline(
 warpscan_forward = module.warpscan_forward
 warpscan_backward = module.warpscan_backward
 
-def scan_forward(gates, tokens, reverse=False):
-    output = torch.zeros_like(tokens)
-    warpscan_forward(gates, tokens, output, reverse)
+@custom_op("accelerated_scan::warp_forward", mutates_args=())
+def warp_forward(gates: Tensor, tokens: Tensor) -> Tensor:
+    torch._check(gates.shape == tokens.shape)
+    torch._check(gates.device == tokens.device)
+    torch._check(gates.is_cuda); torch._check(tokens.is_cuda)
+    torch._check(gates.dtype == tokens.dtype)
+
+    gates = gates.contiguous()
+    tokens = tokens.contiguous()
+
+    output = torch.empty_like(tokens)
+    warpscan_forward(gates, tokens, output, False)
+
     return output
 
+@warp_forward.register_fake
+def _(gates: Tensor, tokens: Tensor) -> Tensor:
+    torch._check(gates.shape == tokens.shape)
+    torch._check(gates.device == tokens.device)
+    torch._check(gates.is_cuda); torch._check(tokens.is_cuda)
+    torch._check(gates.dtype == tokens.dtype)
 
-class Scan(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, gates, tokens):
-        B, C, T = gates.shape
-        assert tokens.shape == (B, C, T)
-        assert gates.is_contiguous()
-        assert tokens.is_contiguous()
+    return torch.empty_like(tokens, memory_format=torch.contiguous_format)
 
-        states = scan_forward(gates, tokens)
-        ctx.save_for_backward(states, gates)
-        return states
+# backward scan is a padded reverse scan
+# See https://arxiv.org/abs/1709.04057 Section 2.2
+@custom_op("accelerated_scan::warp_backward", mutates_args=())
+def warp_backward(states: Tensor, gates: Tensor, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+    torch._check(states.shape == gates.shape)
+    torch._check(states.device == gates.device)
+    torch._check(states.is_cuda); torch._check(gates.is_cuda)
+    torch._check(states.dtype == gates.dtype)
 
-    # backward scan is a padded reverse scan
-    # See https://arxiv.org/abs/1709.04057 Section 2.2
-    @staticmethod
-    def backward(ctx, grad_output):
-        states, gates = ctx.saved_tensors
-        B, C, T = gates.shape
+    grad_output = grad_output.contiguous()
+    states = states.contiguous()
+    gates = gates.contiguous()
 
-        grad_output = grad_output.contiguous()
-        assert states.is_contiguous()
-        assert gates.is_contiguous()
+    d_gates = torch.empty_like(gates)
+    d_tokens = torch.empty_like(states)
+    warpscan_backward(gates, states, grad_output, d_gates, d_tokens)
 
-        d_gates = torch.empty_like(gates)
-        d_tokens = torch.empty_like(gates)
-        warpscan_backward(gates, states, grad_output, d_gates, d_tokens)
+    return d_gates, d_tokens
 
-        return d_gates, d_tokens
+@warp_backward.register_fake
+def _(states: Tensor, gates: Tensor, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+    torch._check(states.shape == gates.shape)
+    torch._check(states.device == gates.device)
+    torch._check(states.is_cuda); torch._check(gates.is_cuda)
+    torch._check(states.dtype == gates.dtype)
+
+    return (
+        torch.empty_like(states, memory_format=torch.contiguous_format),
+        torch.empty_like(gates, memory_format=torch.contiguous_format),
+    )
+
+def _setup_context(ctx, inputs, output):
+    gates, _tokens = inputs
+    ctx.save_for_backward(output, gates)
+
+def _backward(ctx, grad_output):
+    states, gates = ctx.saved_tensors
+    return warp_backward(states, gates, grad_output)
+
+warp_forward.register_autograd(_backward, setup_context=_setup_context)
 
 
-def scan(gates, tokens):
+def scan(gates: Tensor, tokens: Tensor) -> Tensor:
     """Solve a first-order recurrence relation:
 
     .. math::
@@ -80,4 +111,4 @@ def scan(gates, tokens):
     Returns:
         (torch.Tensor): shape (B, C, T)
     """
-    return Scan.apply(gates, tokens)
+    return warp_forward(gates, tokens)
